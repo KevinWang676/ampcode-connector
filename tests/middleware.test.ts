@@ -13,9 +13,14 @@ describe("path.passthrough", () => {
     expect(path.passthrough("/api/telemetry")).toBe(true);
     expect(path.passthrough("/api/threads")).toBe(true);
     expect(path.passthrough("/api/threads/123")).toBe(true);
+    expect(path.passthrough("/api/thread-actors")).toBe(true);
+    expect(path.passthrough("/api/thread-actors/123/events")).toBe(true);
+    expect(path.passthrough("/api/attachments")).toBe(true);
+    expect(path.passthrough("/api/attachments/file-id")).toBe(true);
     expect(path.passthrough("/api/otel")).toBe(true);
     expect(path.passthrough("/api/tab")).toBe(true);
     expect(path.passthrough("/api/durable-thread-workers")).toBe(true);
+    expect(path.passthrough("/api/v2/workspace/project/T-123")).toBe(true);
   });
 
   test("rejects browser routes (handled separately)", () => {
@@ -57,6 +62,7 @@ describe("path.browser", () => {
     expect(path.browser("/docs")).toBe(true);
     expect(path.browser("/docs/api")).toBe(true);
     expect(path.browser("/settings")).toBe(true);
+    expect(path.browser("/v2/workspace/project/T-123")).toBe(true);
   });
 
   test("rejects API routes", () => {

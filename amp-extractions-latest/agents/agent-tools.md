@@ -1,45 +1,156 @@
-# AMP CLI Agent Tools (Latest Binary)
+# AMP CLI Built-in Tool Details (Latest Binary)
 
 - **Source binary:** `~/.amp/bin/amp`
-- **Version:** `0.0.1773129970-gb3ab74 (released 2026-03-10T08:11:50.960Z, 2h ago)`
-- **Extraction date:** 2026-03-10T11:05:25.332Z
-- **Method:** `amp tools list` + `amp tools show <tool>`.
+- **Version:** `0.0.1778130306-g2889d9 (released 2026-05-07T05:06:28.128Z)`
+- **Extraction date:** 2026-05-07T05:16:00+00:00
+- **Method:** `amp tools list --json --mode <mode>` to find active tools, then `amp --mode <mode> tools show <tool>` for schemas.
 
-## Active Tools List
+## Tool Mode Map
 
-```text
-23 tools available
+| Tool | Shown With Mode | Active Modes |
+|---|---|---|
+| `apply_patch` | `deep` | `deep` |
+| `Bash` | `smart` | `smart,rush,large` |
+| `chart` | `deep` | `deep,rush` |
+| `create_file` | `smart` | `smart,rush,large` |
+| `edit_file` | `smart` | `smart,rush,large` |
+| `find_thread` | `smart` | `smart,deep,rush,large` |
+| `finder` | `smart` | `smart,deep,rush,large` |
+| `glob` | `rush` | `rush` |
+| `Grep` | `rush` | `rush` |
+| `handoff` | `smart` | `smart,deep,rush,large` |
+| `librarian` | `smart` | `smart,deep,rush,large` |
+| `look_at` | `smart` | `smart,deep,rush,large` |
+| `mcp__exa__crawling_exa` | `smart` | `smart,deep,rush,large` |
+| `mcp__exa__get_code_context_exa` | `smart` | `smart,deep,rush,large` |
+| `mcp__exa__web_search_exa` | `smart` | `smart,deep,rush,large` |
+| `mcp__grep__searchGitHub` | `smart` | `smart,deep,rush,large` |
+| `oracle` | `smart` | `smart,deep,rush,large` |
+| `painter` | `smart` | `smart,deep,rush,large` |
+| `Read` | `smart` | `smart,rush,large` |
+| `read_mcp_resource` | `smart` | `smart,rush,large` |
+| `read_thread` | `smart` | `smart,deep,rush,large` |
+| `read_web_page` | `smart` | `smart,deep,rush,large` |
+| `shell_command` | `deep` | `deep` |
+| `skill` | `smart` | `smart,deep,rush,large` |
+| `Task` | `smart` | `smart,rush,large` |
+| `task_list` | `rush` | `rush` |
+| `web_search` | `smart` | `smart,deep,rush,large` |
 
-Built-in
-  Bash               Executes the given shell command using bash (or sh on systems without bash)
-  chart              Render a chart visualization by running a command that produces JSON data
-  create_file        Create or overwrite a file in the workspace
-  edit_file          Make edits to a text file
-  find_thread        Find Amp threads (conversation threads with the agent) using a query DSL
-  finder             Intelligently search your codebase
-  glob               Fast file pattern matching tool that works with any codebase size
-  Grep               Search for exact text patterns in files using ripgrep, a fast keyword search tool
-  handoff            Hand off work to a new thread that runs in the background
-  librarian          The Librarian - a specialized codebase understanding agent that helps answer questions about large, complex codebases
-  look_at            Extract specific information from a local file (including PDFs, images, and other media)
-  mermaid            Renders a Mermaid diagram from the provided code
-  oracle             Consult the oracle - an AI advisor powered by OpenAI's GPT-5
-  painter            Generate an image using an AI model
-  Read               Read a file or list a directory from the file system
-  read_mcp_resource  Read a resource from an MCP (Model Context Protocol) server
-  read_thread        Read and extract relevant content from another Amp thread by its ID
-  read_web_page      Read the contents of a web page at a given URL
-  skill              Load a specialized skill that provides domain-specific instructions and workflows
-  Task               Perform a task (a sub-task of the user's overall task) using a sub-agent that has access to the following tools
-  task_list          Plan and track tasks
-  undo_edit          Undo the last edit made to a file
-  web_search         Search the web for information relevant to a research objective
+## Tool Definitions
+
+===== TOOL: apply_patch (shown with --mode deep; modes: deep) =====
+# apply_patch (built-in)
+
+Apply a patch to one or more files using the Codex patch format.
+
+You MUST read the file before applying a patch to it.
+
+## Patch Format
+
+The patch must be wrapped in `*** Begin Patch` and `*** End Patch` markers.
+
+Each operation starts with one of three headers:
+- `*** Add File: <path>` - create a new file. Every following line must start with `+`.
+- `*** Delete File: <path>` - remove an existing file. Nothing follows.
+- `*** Update File: <path>` - patch an existing file (optionally with a rename via `*** Move to:`).
+
+### Grammar
+
+```
+Patch       := Begin { FileOp } End
+Begin       := "*** Begin Patch" NEWLINE
+End         := "*** End Patch" NEWLINE
+FileOp      := AddFile | DeleteFile | UpdateFile
+AddFile     := "*** Add File: " path NEWLINE { "+" line NEWLINE }
+DeleteFile  := "*** Delete File: " path NEWLINE
+UpdateFile  := "*** Update File: " path NEWLINE [ MoveTo ] { Hunk }
+MoveTo      := "*** Move to: " newPath NEWLINE
+Hunk        := "@@" [ " " header ] NEWLINE { HunkLine } [ "*** End of File" NEWLINE ]
+HunkLine    := (" " | "-" | "+") text NEWLINE
 ```
 
-## Tool Definitions (Full Dump)
+## Context Rules
+- By default, show **3 lines** of unchanged code immediately above and 3 lines immediately below each change.
+- Treat 3 lines as a minimum, not a target. For large files, repeated code, or any edit that could plausibly match in multiple places, prefer **5-10 lines** of unchanged context on each side.
+- If a change is within the chosen context window of a previous change, do NOT duplicate the first change's context-after lines in the second change's context-before lines.
+- If 3 lines of context is insufficient to uniquely identify the location, use the `@@` operator to indicate the class or function the snippet belongs to. For example:
+  `@@ class BaseClass`
+  [3+ lines of pre-context]
+  [changes]
+  [3+ lines of post-context]
+- If a code block is repeated so many times that even a single `@@` header and 3 lines of context cannot uniquely identify it, use multiple `@@` statements to narrow the location:
+  `@@ class BaseClass`
+  `@@ def method():`
+  [3+ lines of pre-context]
+  [changes]
+  [3+ lines of post-context]
+## Additional Rules
+- **When editing conflict markers**, ensure their length matches the file's existing marker length (e.g., jj markers like `<<<<<<<`, `%%%%%%%`, or `\\\\`/longer).
+- For Add File: every content line MUST start with `+` (which gets stripped)
+- For Update File hunks: lines start with ` ` (context), `-` (remove), or `+` (add)
+- Use `*** End of File` marker to anchor changes at end of file
+- Multiple files can be patched in a single call
+- File paths can be relative or absolute
+- Don't use apply patch for edits that an available linter or formatter could do based on the instructions in the users AGENTS.md file.
 
-```text
-===== TOOL: Bash =====
+## Reliability Tips (Hard Cases)
+- Repeated blocks (CSS vars, test mocks, large "god" files): include a *unique* `@@ ...` header, and add 5-10 or more context lines until the target is unique.
+- If you only read part of a file, do not guess. Read more of the file and expand the context until the hunk can match only once.
+- Indentation-sensitive files (Svelte/CSS/TS): keep indentation exactly as in the file (tabs vs spaces). Do not reindent unrelated lines.
+- Insert-only hunks (no `-` lines): avoid unanchored insert-only hunks; include a nearby unchanged context line (either via `@@` header or ` ` context lines) to show *where* to insert.
+- Ambiguous matches are worse than verbose hunks. Prefer a longer patch over a shorter patch that could apply in multiple places.
+- Whitespace drift: avoid changing internal spacing in context lines (e.g., `get: () =>` vs `get:  () =>`). Copy context lines from the file.
+- CRLF files: keep line endings consistent with the file you're patching.
+
+# Examples
+
+Add a new file
+```json
+{"patchText":"*** Begin Patch\n*** Add File: path/to/new/file.ts\n+const hello = 'world'\n+export { hello }\n*** End Patch"}
+```
+
+Simple update with context
+```json
+{"patchText":"*** Begin Patch\n*** Update File: src/utils/helpers.ts\n@@\n export function processData(input: string) {\n   const normalized = input.trim()\n   if (!normalized) {\n     return 'default'\n   }\n-  return normalized\n+  return normalized.toLowerCase()\n }\n\n export function formatLabel(label: string) {\n   return label.toUpperCase()\n }\n*** End Patch"}
+```
+
+Update a nested structure (include extra context lines to disambiguate the edit)
+```json
+{"patchText":"*** Begin Patch\n*** Update File: src/services/user-service.ts\n@@ class UserService\n   constructor(\n     private readonly repo: UserRepo,\n     private readonly logger: Logger,\n   ) {}\n\n   async updateUser(id: string, data: UserData) {\n     const user = await this.findById(id)\n-    user.name = data.name\n+    user.name = data.name?.trim() || user.name\n+    user.updatedAt = new Date()\n     await this.save(user)\n     return user\n   }\n }\n*** End Patch"}
+```
+
+Large or repetitive files: prefer 5+ context lines so the hunk matches only once
+```json
+{"patchText":"*** Begin Patch\n*** Update File: src/theme/button-tokens.ts\n@@ export const buttonTokens = {\n   primary: {\n     background: colors.blue[500],\n     foreground: colors.white,\n     border: colors.blue[600],\n     hoverBackground: colors.blue[600],\n     activeBackground: colors.blue[700],\n-    focusRing: colors.blue[300],\n+    focusRing: colors.cyan[300],\n     disabledBackground: colors.gray[300],\n     disabledForeground: colors.gray[500],\n   },\n   secondary: {\n*** End Patch"}
+```
+
+Use multiple @@ blocks to skip intervening code
+```json
+{"patchText":"*** Begin Patch\n*** Update File: src/config/settings.ts\n@@\n const defaultConfig = {\n   name: 'myapp',\n   version: '1.0.0',\n   featureFlags: {\n     metrics: true,\n     tracing: false,\n   },\n@@\n   logging: {\n     destination: 'stdout',\n-    level: 'info',\n+    level: 'debug',\n     format: 'json',\n     redact: ['token'],\n   },\n   retries: 3,\n*** End Patch"}
+```
+
+Editing content within jj conflict markers
+```json
+{"patchText":"*** Begin Patch\n*** Update File: src/config.ts\n@@\n <<<<<<< Conflict 1 of 1\n %%%%%%% Changes from base to side #1\n \\\\\\       (rebase destination)\n- const API_URL = 'http://localhost:3000'\n+ const API_URL = 'https://api.example.com'\n +++++++ Contents of side #2\n const API_URL = 'http://staging.example.com'\n >>>>>>> Conflict 1 of 1 ends\n*** End Patch"}
+```
+
+Deleting a file
+```json
+{"patchText":"*** Begin Patch\n*** Delete File: path/to/delete.ts\n*** End Patch"}
+```
+
+Moving/renaming a file with changes
+```json
+{"patchText":"*** Begin Patch\n*** Update File: src/old-name.ts\n*** Move to: src/new-name.ts\n@@\n-export function oldName() {\n+export function newName() {\n   return 'hello'\n }\n*** End Patch"}
+```
+
+
+# Schema
+
+- patchText (string): The full patch text that describes all changes to be made
+
+===== TOOL: Bash (shown with --mode smart; modes: smart,rush,large) =====
 # Bash (built-in)
 
 Executes the given shell command using bash (or sh on systems without bash).
@@ -52,7 +163,11 @@ Executes the given shell command using bash (or sh on systems without bash).
 - Only the last 50000 characters of the output will be returned to you along with how many lines got truncated, if any; rerun with a grep or head/tail filter if needed
 - On Windows, use PowerShell commands and `\` path separators
 - ALWAYS quote file paths: `cat "path with spaces/file.txt"`
-- Use finder/Grep instead of find/grep, Read instead of cat, edit_file instead of sed
+- When searching for text or files, prefer using `rg` or `rg --files` respectively because `rg` is much faster than alternatives like `grep`. (If the `rg` command is not found, then use alternatives.)
+- Do NOT run `find` (or any recursive search) from `/`, `~`, or another large unrelated root; scope it to the workspace or a specific directory you have reason to search, otherwise it will be extremely slow and waste tokens
+- When using `find` or `grep -r`, exclude heavy directories like `node_modules`, `.git`, `dist`, `build`, and `target` (`rg` already skips these via gitignore)
+- Do NOT pipe `cat file | grep/awk/sed/...`; pass the file directly to the command (e.g. `grep pattern file`)
+- When using `grep`, pass `-E` (or use `egrep`) to enable extended regular expressions; `rg` uses extended regex by default.
 - Only run `git commit` and `git push` if explicitly instructed by the user.
 
 
@@ -61,8 +176,7 @@ Executes the given shell command using bash (or sh on systems without bash).
 - cmd (string): The shell command to execute
 - cwd (string): Absolute path to a directory where the command will be executed (must be absolute, not relative)
 
-
-===== TOOL: chart =====
+===== TOOL: chart (shown with --mode deep; modes: deep,rush) =====
 # chart (built-in)
 
 Render a chart visualization by running a command that produces JSON data. The chart is displayed inline to the user.
@@ -129,8 +243,7 @@ Stacked area chart with groupColumn (auto-pivots rows by credit_type):
 - hoverColumns (array of string): Extra columns to display in hover tooltips but not plotted on the Y axis.
 - groupColumn (string): Column whose unique values become separate series. Pivots unpivoted data — e.g., a "type" column creates one series per type. Use with a single yColumn.
 
-
-===== TOOL: create_file =====
+===== TOOL: create_file (shown with --mode smart; modes: smart,rush,large) =====
 # create_file (built-in)
 
 Create or overwrite a file in the workspace.
@@ -145,8 +258,7 @@ For **existing files**, prefer `edit_file` instead—even for extensive changes.
 - path (string): The absolute path of the file to be created (must be absolute, not relative). If the file exists, it will be overwritten. ALWAYS generate this argument first.
 - content (string): The content for the file.
 
-
-===== TOOL: edit_file =====
+===== TOOL: edit_file (shown with --mode smart; modes: smart,rush,large) =====
 # edit_file (built-in)
 
 Make edits to a text file.
@@ -173,8 +285,7 @@ If you need to replace the entire contents of a file, use `create_file` instead,
 - new_str (string): Text to replace old_str with.
 - replace_all (boolean): Set to true to replace all matches of old_str. Else, old_str must be an unique match.
 
-
-===== TOOL: find_thread =====
+===== TOOL: find_thread (shown with --mode smart; modes: smart,deep,rush,large) =====
 # find_thread (built-in)
 
 Find Amp threads (conversation threads with the agent) using a query DSL.
@@ -188,11 +299,11 @@ This tool searches **Amp threads** (conversations with the agent), NOT git commi
 - **Keywords**: Bare words or quoted phrases for text search: `auth` or `"race condition"`
 - **File filter**: `file:path` to find threads that touched a file: `file:src/auth/login.ts`
 - **Repo filter**: `repo:url` to scope to a repository: `repo:github.com/owner/repo` or `repo:owner/repo`
+- **Ref filter**: `ref:name` to scope to a git ref: `ref:main`
 - **Author filter**: `author:name` to find threads by a user: `author:alice` or `author:me` for your own threads
 - **Date filters**: `after:date` and `before:date` to filter by date: `after:2024-01-15`, `after:7d`, `before:2w`
 - **Task filter**: `task:id` to find threads that worked on a task: `task:142`. Use `task:142+` to include threads that worked on the task's dependencies, `task:142^` to include dependents (tasks that depend on this task), or `task:142+^` for both.
-- **Cluster filter**: `cluster_of:id` to find threads in the same cluster as a thread: `cluster_of:T-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`
-- **Combine filters**: Use implicit AND: `auth file:src/foo.ts repo:amp after:7d`
+- **Combine filters**: Use implicit AND: `auth file:src/foo.ts repo:amp ref:main after:7d`
 
 All matching is case-insensitive. File paths use partial matching. Date formats: ISO dates (`2024-01-15`), relative days (`7d`), or weeks (`2w`).
 
@@ -254,11 +365,10 @@ User asks: "Show me all threads related to task 50 and tasks that depend on it"
 
 # Schema
 
-- query (string): Search query using DSL syntax. Supports keywords, file:path, repo:url, author:name, after:date, before:date, task:id, and cluster_of:id filters.
+- query (string): Search query using DSL syntax. Supports keywords, file:path, repo:url, author:name, after:date, before:date, and task:id filters.
 - limit (number): Maximum number of threads to return. Defaults to 20.
 
-
-===== TOOL: finder =====
+===== TOOL: finder (shown with --mode smart; modes: smart,deep,rush,large) =====
 # finder (built-in)
 
 Intelligently search your codebase: Use it for complex, multi-step search tasks where you need to find code based on functionality or concepts rather than exact matches. Anytime you want to chain multiple grep calls you should use this tool.
@@ -283,14 +393,17 @@ USAGE GUIDELINES:
 3. Name concrete artifacts, patterns, or APIs to narrow scope (e.g., "Express middleware", "fs.watch debounce").
 4. State explicit success criteria so the agent knows when to stop (e.g., "Return file paths and line numbers for all JWT verification calls").
 5. Never issue vague or exploratory commands - be definitive and goal-oriented.
+6. Avoid broad root-level filename globs when you can scope to a directory.
+   ✓ "Find watchdog-related files under core and server/src."
+   ✗ "Find files named watchdog anywhere."
+7. Prefer scoped Grep searches before falling back to repo-wide filename scans.
 
 
 # Schema
 
 - query (string): The search query describing to the agent what it should. Be specific and include technical terms, file types, or expected code patterns to help the agent find relevant code. Formulate the query in a way that makes it clear to the agent when it has found the right thing.
 
-
-===== TOOL: glob =====
+===== TOOL: glob (shown with --mode rush; modes: rush) =====
 # glob (built-in)
 
 Fast file pattern matching tool that works with any codebase size
@@ -303,7 +416,7 @@ Use this tool to find files by name patterns across your codebase. Results are r
 - `src/**/*.ts` - All TypeScript files under the src directory (searches only in src)
 - `*.json` - All JSON files in the current directory
 - `**/*test*` - All files with "test" in their name
-- `web/src/**/*` - All files under the web/src directory
+- `server/src/**/*` - All files under the server/src directory
 - `**/*.{js,ts}` - All JavaScript and TypeScript files (alternative patterns)
 - `src/[a-z]*/*.ts` - TypeScript files in src subdirectories that start with lowercase letters
 
@@ -319,9 +432,9 @@ Find all test files under a specific directory
 {"filePattern":"src/**/*test*.ts"}
 ```
 
-Search for svelte component files in the web/src directory
+Search for Svelte component files in the server/src directory
 ```json
-{"filePattern":"web/src/**/*.svelte"}
+{"filePattern":"server/src/**/*.svelte"}
 ```
 
 Find up to 10 JSON files
@@ -336,8 +449,7 @@ Find up to 10 JSON files
 - limit (number): Maximum number of results to return (default: 200, max: 1000)
 - offset (number): Number of results to skip (for pagination)
 
-
-===== TOOL: Grep =====
+===== TOOL: Grep (shown with --mode rush; modes: rush) =====
 # Grep (built-in)
 
 Search for exact text patterns in files using ripgrep, a fast keyword search tool.
@@ -346,9 +458,11 @@ Search for exact text patterns in files using ripgrep, a fast keyword search too
 - Finding exact text matches (variable names, function calls, specific strings)
 - Use finder for semantic/conceptual searches
 
-# Strategy
-- Use 'path' or 'glob' to narrow searches; run multiple focused calls rather than one broad search
-- Uses Rust-style regex (escape `{` and `}`); use `literal: true` for literal text search
+# How to use it well
+# Efficient usage
+- Scope with `path` first; add `glob` when file type matters
+- Prefer several focused searches over one repo-wide scan
+- Use `literal: true` for exact text; keep regex for patterns
 
 # Constraints
 - Results are limited to 100 matches (up to 10 per file)
@@ -373,7 +487,7 @@ Use a case-sensitive search to find the exact string `ERROR:`
 
 Find TODO comments in frontend code
 ```json
-{"pattern":"TODO:","path":"web/src"}
+{"pattern":"TODO:","path":"server/src"}
 ```
 
 Find a specific function name in test files
@@ -386,9 +500,9 @@ Find all REST API endpoint definitions
 {"pattern":"app\\.(get|post|put|delete)\\([\"']","path":"server"}
 ```
 
-Locate CSS class definition in stylesheets
+Locate route helper usage in Svelte routes
 ```json
-{"pattern":"\\.container\\s*\\{","path":"web/src/styles"}
+{"pattern":"route\\(","path":"server/src/routes"}
 ```
 
 # Complementary to finder
@@ -400,13 +514,12 @@ Locate CSS class definition in stylesheets
 # Schema
 
 - pattern (string): The pattern to search for (regex)
-- path (string): The file or directory path to search in. Cannot be used with glob.
-- glob (string): The glob pattern to search for. Cannot be used with path.
+- path (string): The file or directory path to search in. Use this first to avoid repo-wide scans. Cannot be used with glob.
+- glob (string): A glob filter like "**/*.ts". Use this when file type matters. Cannot be used with path.
 - caseSensitive (boolean): Whether to search case-sensitively
-- literal (boolean): Whether to treat the pattern as a literal string instead of a regex
+- literal (boolean): Whether to treat the pattern as exact text instead of a regex. Prefer this for identifiers and copied strings.
 
-
-===== TOOL: handoff =====
+===== TOOL: handoff (shown with --mode smart; modes: smart,deep,rush,large) =====
 # handoff (built-in)
 
 Hand off work to a new thread that runs in the background. Use this tool when you need to continue work in a fresh context because:
@@ -431,48 +544,40 @@ Use the mode parameter when the user explicitly requests a different agent mode 
 - follow (boolean): If true, navigate to the new thread after creation. Use this when the current thread is stopping and work should continue in the new thread.
 - mode (string): The agent mode for the new thread. Defaults to the current thread's agent mode if not specified.
 
-
-===== TOOL: librarian =====
+===== TOOL: librarian (shown with --mode smart; modes: smart,deep,rush,large) =====
 # librarian (built-in)
 
-The Librarian - a specialized codebase understanding agent that helps answer questions about large, complex codebases.
-The Librarian works by reading from GitHub - it can see the private repositories the user approved access to in addition to all public repositories on GitHub.
-The Librarian also supports Bitbucket Enterprise (self-hosted) repositories when the user has connected their Bitbucket Enterprise instance.
+The Librarian is a codebase-understanding subagent for
+repositories outside the local workspace.
 
-The Librarian acts as your personal multi-repository codebase expert, providing thorough analysis and comprehensive explanations across repositories.
+It can read public GitHub repositories, connected private GitHub repositories, and connected
+Bitbucket Enterprise repositories.
 
-It's ideal for complex, multi-step analysis tasks where you need to understand code architecture, functionality, and patterns across multiple repositories.
+Use this when you need deep understanding of existing code across one or more repositories:
+- explaining architecture, flows, or subsystem design
+- finding where a feature is implemented in an external codebase
+- comparing patterns across repositories
+- understanding how code evolved through commit history
+- reading or diffing files in a remote repository
 
-WHEN TO USE THE LIBRARIAN:
-- Understanding complex multi-repository codebases and how they work
-- Exploring relationships between different repositories
-- Analyzing architectural patterns across large open-source projects
-- Finding specific implementations across multiple codebases
-- Understanding code evolution and commit history
-- Getting comprehensive explanations of how major features work
-- Exploring how systems are designed end-to-end across repositories
+Do not use this for:
+- local workspace reads or searches
+- code modifications or implementations
+- simple local lookups when a direct local tool is enough
+- questions unrelated to understanding existing repositories
 
-WHEN NOT TO USE THE LIBRARIAN:
-- Simple local file reading (use Read directly)  
-- Local codebase searches (use finder)
-- Code modifications or implementations (use other tools)
-- Questions not related to understanding existing repositories
+Guidance:
+- name the repository or project when you know it
+- ask a specific question or describe the feature or codepath you want understood
+- include context about what you are trying to achieve
+- expect a thorough answer suitable for sharing
+- return the answer in full rather than summarizing it
 
-USAGE GUIDELINES:
-1. Be specific about what repositories or projects you want to understand
-2. Provide context about what you're trying to achieve
-3. The Librarian will explore thoroughly across repositories before providing comprehensive answers
-4. Expect detailed, documentation-quality responses suitable for sharing
-5. When getting an answer from the Librarian, show it to the user in full, do not summarize it.
-
-EXAMPLES:
+Examples:
 - "How does authentication work in the Kubernetes codebase?"
 - "Explain the architecture of the React rendering system"
-- "Find how database migrations are handled in Rails"
-- "Understand the plugin system in the VSCode codebase"
 - "Compare how different web frameworks handle routing"
 - "What changed in commit abc123 in my private repository?"
-- "Show me the diff for commit fb492e2 in github.com/mycompany/private-repo"
 - "Read the README from the main API repo on our Bitbucket Enterprise instance"
 
 
@@ -481,8 +586,7 @@ EXAMPLES:
 - query (string): Your question about the codebase. Be specific about what you want to understand or explore.
 - context (string): Optional context about what you're trying to achieve or background information.
 
-
-===== TOOL: look_at =====
+===== TOOL: look_at (shown with --mode smart; modes: smart,rush,large) =====
 # look_at (built-in)
 
 Extract specific information from a local file (including PDFs, images, and other media).
@@ -529,60 +633,7 @@ Compare two screenshots to identify visual differences
 - context (string): The broader goal and context for the analysis. Include relevant background information about what you are trying to achieve and why this analysis is needed.
 - referenceFiles (array of string): Optional list of absolute paths to reference files for comparison (e.g., to compare two screenshots or documents).
 
-
-===== TOOL: mermaid =====
-# mermaid (built-in)
-
-Renders a Mermaid diagram from the provided code.
-
-PROACTIVELY USE DIAGRAMS when they would better convey information than prose alone. The diagrams produced by this tool are shown to the user.
-
-You should create diagrams WITHOUT being explicitly asked in these scenarios:
-- When explaining system architecture or component relationships
-- When describing workflows, data flows, or user journeys
-- When explaining algorithms or complex processes
-- When illustrating class hierarchies or entity relationships
-- When showing state transitions or event sequences
-
-Diagrams are especially valuable for visualizing:
-- Application architecture and dependencies
-- API interactions and data flow
-- Component hierarchies and relationships
-- State machines and transitions
-- Sequence and timing of operations
-- Decision trees and conditional logic
-
-# Citations
-- **Always include `citations` to as many nodes and edges as possible to make diagram elements clickable, linking to code locations.**
-- Do not add wrong citation and if needed read the file again to validate the code links.
-- Keys: node IDs (e.g., `"api"`) or edge labels (e.g., `"authenticate(token)"`)
-- Values: file:// URIs with optional line range (e.g., `file:///src/api.ts#L10-L50`)
-
-<examples>
-
-Flowchart with clickable nodes
-<example>
-{"code":"flowchart LR\n    api[API Layer] --> svc[Service Layer]\n    svc --> db[(Database)]","citations":{"api":"file:///src/api/routes.ts#L1-L100","svc":"file:///src/services/index.ts#L10-L50","db":"file:///src/models/schema.ts"}}
-</example>
-
-Sequence diagram with clickable actors AND messages
-<example>
-{"code":"sequenceDiagram\n    Client->>Server: authenticate(token)\n    Server->>DB: validate_token()","citations":{"Client":"file:///src/client/index.ts","Server":"file:///src/server/handler.ts","authenticate(token)":"file:///src/server/auth.ts#L25-L40","validate_token()":"file:///src/db/tokens.ts#L10-L30"}}
-</example>
-
-</examples>
-
-# Styling
-- When defining custom classDefs, always define fill color, stroke color, and text color ("fill", "stroke", "color") explicitly
-- IMPORTANT!!! Use DARK fill colors (close to #000) with light stroke and text colors (close to #fff)
-
-# Schema
-
-- code (string): The Mermaid diagram code to render (DO NOT override with custom colors or other styles, DO NOT use HTML tags in node labels)
-- citations (object): REQUIRED: Map of citation keys to file:// URIs for clickable code navigation. Keys can be node IDs (e.g., "api") or edge labels (e.g., "run_rollout(request)"). Use {} if no code references apply.
-
-
-===== TOOL: oracle =====
+===== TOOL: oracle (shown with --mode smart; modes: smart,deep,rush,large) =====
 # oracle (built-in)
 
 Consult the oracle - an AI advisor powered by OpenAI's GPT-5.4 reasoning model that can plan, review, and provide expert guidance.
@@ -647,8 +698,7 @@ Debug failing tests after refactor
 - context (string): Optional context about the current situation, what you've tried, or background information that would help the oracle provide better guidance.
 - files (array of string): Optional list of specific file paths (text files, images) that the oracle should examine as part of its analysis. These files will be attached to the oracle input.
 
-
-===== TOOL: painter =====
+===== TOOL: painter (shown with --mode smart; modes: smart,deep,rush,large) =====
 # painter (built-in)
 
 Generate an image using an AI model.
@@ -666,7 +716,7 @@ IMPORTANT: Only invoke this tool when the user explicitly asks to use the "paint
 ## When NOT to use this tool
 
 - Do NOT use automatically for UI mockups, diagrams, or icons—only unless explicitly requested by user
-- For code-linked diagrams—use the "mermaid" tool instead
+- For diagrams—write a plain-text box-drawing `diagram` code block with rounded-corner boxes where possible; there is no Mermaid tool or renderer, so do not write Mermaid syntax or `mermaid` code fences
 - For analyzing existing images—use the "look_at" tool instead
 
 ## Example Scenarios
@@ -704,8 +754,7 @@ Generate an image and save to the Documents folder (Windows)
 - inputImagePaths (array of string): Optional image paths provided by the user for editing or style guidance. Maximum 3 images allowed. Each image path should be same as the `sourcePath` provided by the user.
 - savePath (string): Optional absolute path to save the generated image (e.g., C:/Users/name/Documents/image.png on Windows, /home/user/Documents/image.png on Linux/Mac). Only valid when a single image is generated.
 
-
-===== TOOL: Read =====
+===== TOOL: Read (shown with --mode smart; modes: smart,rush,large) =====
 # Read (built-in)
 
 Read a file or list a directory from the file system. If the path is a directory, it returns a line-numbered list of entries. If the file or directory doesn't exist, an error is returned.
@@ -726,8 +775,7 @@ Read a file or list a directory from the file system. If the path is a directory
 - path (string): The absolute path to the file or directory (MUST be absolute, not relative).
 - read_range (array of number): An array of two integers specifying the start and end line numbers to view. Line numbers are 1-indexed. If not provided, defaults to [1, 1000]. Examples: [500, 700], [700, 1400]
 
-
-===== TOOL: read_mcp_resource =====
+===== TOOL: read_mcp_resource (shown with --mode smart; modes: smart,rush,large) =====
 # read_mcp_resource (built-in)
 
 Read a resource from an MCP (Model Context Protocol) server.
@@ -752,17 +800,16 @@ Read a database record from an MCP database server
 - server (string): The name or identifier of the MCP server to read from
 - uri (string): The URI of the resource to read
 
-
-===== TOOL: read_thread =====
+===== TOOL: read_thread (shown with --mode smart; modes: smart,deep,rush,large) =====
 # read_thread (built-in)
 
-Read and extract relevant content from another Amp thread by its ID.
+Read and extract relevant content from another Amp thread by its ID or ampcode.com URL.
 
 This tool fetches a thread (locally or from the server if synced), renders it as markdown, and uses AI to extract only the information relevant to your specific goal. This keeps context concise while preserving important details.
 
 ## When to use this tool
 
-- When the user pastes or references an Amp thread URL (format: https://ampcode.com/threads/T-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx) in their message
+- When the user pastes or references an Amp thread URL on ampcode.com whose last path segment is a thread ID (for example https://ampcode.com/threads/T-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx or https://ampcode.com/v2/workspace/project/T-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx) in their message
 - When the user references a thread ID (format: T-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx or @T-abc123)
 - When the user asks to "apply the same approach from [thread URL]"
 - When the user says "do what we did in [thread URL]"
@@ -776,7 +823,7 @@ This tool fetches a thread (locally or from the server if synced), renders it as
 
 ## Parameters
 
-- **threadID**: The thread identifier in format T-{uuid} (e.g., "T-a38f981d-52da-47b1-818c-fbaa9ab56e0c")
+- **threadID**: The thread identifier in format T-{uuid}, or an ampcode.com URL whose last path segment is T-{uuid} (e.g., "T-a38f981d-52da-47b1-818c-fbaa9ab56e0c" or "https://ampcode.com/v2/workspace/project/T-a38f981d-52da-47b1-818c-fbaa9ab56e0c")
 - **goal**: A clear description of what information you're looking for in that thread. Be specific about what you need to extract.
 
 # Examples
@@ -796,19 +843,23 @@ User asks: "Take the SQL queries from https://ampcode.com/threads/T-95e73a95-f4f
 {"threadID":"T-95e73a95-f4fe-4f22-8d5c-6297467c97a5","goal":"Extract all SQL queries, their purpose, parameters, and any context needed to understand how to make them reusable"}
 ```
 
-User asks: "Apply the same fix from @T-def456 to this issue"
+User asks: "Apply the same fix from https://ampcode.com/v2/amp/amp/T-019d01b5-f70d-73ea-9445-f6d358f7213e to this issue"
 ```json
-{"threadID":"T-def456","goal":"Extract the bug description, root cause, the fix/solution, and relevant code changes"}
+{"threadID":"https://ampcode.com/v2/amp/amp/T-019d01b5-f70d-73ea-9445-f6d358f7213e","goal":"Extract the bug description, root cause, the fix or solution, and relevant code changes"}
+```
+
+User asks: "Apply the same fix from @T-95e73a95-f4fe-4f22-8d5c-6297467c97a5 to this issue"
+```json
+{"threadID":"T-95e73a95-f4fe-4f22-8d5c-6297467c97a5","goal":"Extract the bug description, root cause, the fix/solution, and relevant code changes"}
 ```
 
 
 # Schema
 
-- threadID (string): The thread ID in format T-{uuid} (e.g., "T-a38f981d-52da-47b1-818c-fbaa9ab56e0c")
+- threadID (string): The thread ID in format T-{uuid}, or an ampcode.com URL whose last path segment is T-{uuid} (e.g., "T-a38f981d-52da-47b1-818c-fbaa9ab56e0c" or "https://ampcode.com/v2/workspace/project/T-a38f981d-52da-47b1-818c-fbaa9ab56e0c")
 - goal (string): A clear description of what information you need from the thread. Be specific about what to extract.
 
-
-===== TOOL: read_web_page =====
+===== TOOL: read_web_page (shown with --mode smart; modes: smart,deep,rush,large) =====
 # read_web_page (built-in)
 
 Read the contents of a web page at a given URL.
@@ -840,35 +891,50 @@ Extract all text content from a web page
 - objective (string): A natural-language description of the research goal. If set, only relevant excerpts will be returned. If not set, the full content of the web page will be returned. 
 - forceRefetch (boolean): Force a live fetch of the URL (default: use a cached version that may be a few days old)
 
+===== TOOL: shell_command (shown with --mode deep; modes: deep) =====
+# shell_command (built-in)
 
-===== TOOL: skill =====
+Runs a shell command and returns its output.
+- Always set the `workdir` param when using the shell_command function. Do not use `cd` unless absolutely necessary. For doing file changes, use the apply_patch
+- Avoid end-buffering pipes like `| tail -20` for long-running commands; they can hide progress and trigger inactivity timeouts
+- Use `timeout_ms` to increase the inactivity timeout for commands that may stay quiet for long stretches
+
+# Schema
+
+- command (string): Shell command to execute.
+- workdir (string): Optional working directory to run the command in; defaults to the turn cwd.
+- timeout_ms (number): The timeout for the command in milliseconds
+
+===== TOOL: skill (shown with --mode smart; modes: smart,deep,rush,large) =====
 # skill (built-in)
 
-Load a specialized skill that provides domain-specific instructions and workflows.
+Load a specialized skill when the task matches one of the skills listed in the system prompt.
 
-When you recognize that a task matches one of the available skills listed below, use this tool to load the full skill instructions.
+Use this tool to inject that skill's instructions and bundled resources into the current conversation. A loaded skill may provide:
+- task-specific workflow guidance
+- references to scripts, templates, or files in the skill directory
+- additional builtin or MCP tools that become available after loading
 
-The skill will inject detailed instructions, workflows, and access to bundled resources (scripts, references, templates) into the conversation context.
+Use this tool when:
+- the user explicitly asks for a skill by name
+- the task clearly matches a skill description from the system prompt
+
+You usually only need to load a skill once per context window. After it is loaded, continue following its instructions instead of reloading it.
 
 Parameters:
 - name: The name of the skill to load (must match one of the skills listed below)
 
 Example: To use the web-browser skill for interacting with web pages, call this tool with name: "web-browser"
 
-# Available Skills
-
-{{AVAILABLE_SKILLS}}
-
 # Schema
 
 - name (string): The name of the skill to load
 - arguments (string): Optional arguments to pass to the skill
 
-
-===== TOOL: Task =====
+===== TOOL: Task (shown with --mode smart; modes: smart,rush,large) =====
 # Task (built-in)
 
-Perform a task (a sub-task of the user's overall task) using a sub-agent that has access to the following tools: Grep, glob, Read, Bash, edit_file, create_file, read_web_page, get_diagnostics, web_search, finder, skill, task_list.
+Perform a task (a sub-task of the user's overall task) using a sub-agent that has access to the following tools: Read, Bash, edit_file, create_file, read_web_page, web_search, finder, skill, task_list, look_at.
 
 
 When to use the Task tool:
@@ -895,8 +961,7 @@ How to use the Task tool:
 - prompt (string): The task for the agent to perform. Be specific about what needs to be done and include any relevant context.
 - description (string): A very short description of the task that can be displayed to the user.
 
-
-===== TOOL: task_list =====
+===== TOOL: task_list (shown with --mode rush; modes: rush) =====
 # task_list (built-in)
 
 Plan and track tasks. Use this tool for ALL task planning - breaking down work into steps, tracking progress, and managing what needs to be done.
@@ -955,24 +1020,7 @@ create "Deploy to staging", dependsOn: ["integration"]
 - limit (number): Maximum number of tasks to return (for list action)
 - ready (boolean): Filter to only return tasks that are ready to work on (all dependencies completed)
 
-
-===== TOOL: undo_edit =====
-# undo_edit (built-in)
-
-Undo the last edit made to a file.
-
-This command reverts the most recent edit made to the specified file.
-It will restore the file to its state before the last edit was made.
-
-Returns a git-style diff showing the changes that were undone as formatted markdown.
-
-
-# Schema
-
-- path (string): The absolute path to the file whose last edit should be undone (must be absolute, not relative)
-
-
-===== TOOL: web_search =====
+===== TOOL: web_search (shown with --mode smart; modes: smart,deep,rush,large) =====
 # web_search (built-in)
 
 Search the web for information relevant to a research objective.
@@ -997,4 +1045,3 @@ See usage documentation for newly released library features
 - objective (string): A natural-language description of the broader task or research goal, including any source or freshness guidance
 - search_queries (array of string): Optional keyword queries to ensure matches for specific terms are prioritized (recommended for best results)
 - max_results (number): The maximum number of results to return (default: 5)
-```

@@ -107,12 +107,15 @@ export const passthroughPrefixes = [
   "/api/ads",
   "/api/telemetry",
   "/api/threads",
+  "/api/thread-actors",
+  "/api/attachments",
   "/api/otel",
   "/api/tab",
   "/api/durable-thread-workers",
+  "/api/v2",
 ] as const;
 
 /** Browser routes — redirect to ampcode.com (auth cookies need correct domain). */
-export const browserPrefixes = ["/auth", "/threads", "/docs", "/settings"] as const;
+export const browserPrefixes = ["/auth", "/threads", "/docs", "/settings", "/v2"] as const;
 
 export const passthroughExact = ["/threads.rss", "/news.rss"] as const;
