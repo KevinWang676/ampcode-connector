@@ -156,6 +156,7 @@ export class LocalThreadActor {
   private generation = 0;
   private currentAgentMode = "smart";
   private currentReasoningEffort: string | undefined;
+  private activeAssistantMessageId: string | undefined;
   private titleGenerationStarted = false;
   constructor(private readonly options: LocalThreadActorOptions) {
     const snapshot = options.snapshot;
@@ -362,6 +363,7 @@ export class LocalThreadActor {
   private async runInference(agentMode: string, reasoningEffort?: string): Promise<void> {
     const generation = ++this.generation;
     const assistantId = newMessageId();
+    this.activeAssistantMessageId = assistantId;
     this.currentAgentMode = agentMode;
     this.currentReasoningEffort = reasoningEffort;
     this.setAgentState("working", assistantId, agentMode, reasoningEffort);
@@ -383,7 +385,9 @@ export class LocalThreadActor {
       logger.info(`Neo local inference complete text=${result.text.length} toolCalls=${toolCalls.length}`);
       await this.finishAssistantMessage(assistantId, result.text, toolCalls, result.usage, agentMode, reasoningEffort);
     } catch (err) {
+      if (generation !== this.generation) return;
       this.fail(err);
+      this.activeAssistantMessageId = undefined;
       this.setAgentState("idle", assistantId, agentMode, reasoningEffort);
       this.processQueue();
     }
@@ -405,6 +409,7 @@ export class LocalThreadActor {
     this.persist();
 
     if (toolCalls.length === 0) {
+      this.activeAssistantMessageId = undefined;
       this.setAgentState("idle", messageId, agentMode, reasoningEffort);
       this.processQueue();
       return;
@@ -437,7 +442,10 @@ export class LocalThreadActor {
     if (ackExecutor) this.broadcast({ type: "executor_tool_result_ack", toolCallId });
     this.persist();
 
-    if (this.pendingTools.size === 0) void this.runInference(pending.agentMode, pending.reasoningEffort);
+    if (this.pendingTools.size === 0) {
+      this.activeAssistantMessageId = undefined;
+      void this.runInference(pending.agentMode, pending.reasoningEffort);
+    }
   }
 
   private async localToolRun(call: Omit<PendingToolCall, "agentMode">): Promise<JsonRecord | null> {
@@ -580,10 +588,27 @@ export class LocalThreadActor {
 
   private cancel(): void {
     this.generation++;
-    const messageId = this.messages.at(-1)?.messageId;
+    const messageId = this.activeAssistantMessageId ?? this.messages.findLast((message) => message.role === "assistant")?.messageId;
     this.pendingTools.clear();
+    this.approvals.clear();
+    this.broadcastApprovalQueue();
     this.broadcast({ type: "cancelled", seq: this.nextSeq(), messageId });
-    if (messageId) this.broadcast({ type: "delta", messageId, role: "assistant", state: "aborted" });
+    if (messageId) {
+      const existing = this.messages.find((message) => message.messageId === messageId);
+      if (!existing) {
+        const message = this.storeMessage({
+          threadId: this.options.threadId,
+          role: "assistant",
+          messageId,
+          content: [],
+          state: { type: "cancelled", stopReason: "cancelled" },
+          createdAt: nowIso(),
+        });
+        this.broadcast({ type: "message_added", message: this.protocolMessage(message), seq: message.seq });
+      }
+      this.broadcast({ type: "delta", messageId, role: "assistant", blocks: [], state: "cancelled" });
+    }
+    this.activeAssistantMessageId = undefined;
     this.setAgentState("idle", messageId);
     this.persist();
     this.processQueue();

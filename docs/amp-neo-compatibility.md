@@ -63,6 +63,7 @@ The local runtime supports the core bidirectional executor loop:
 - `client_filesystem_read_directory` / `client_filesystem_read_file` relay to executor filesystem requests, and executor results are converted back into client result events.
 - Executor plugin and artifact events are converted into server-side `plugin_message`, `artifact_upserted`, and `artifact_deleted` events.
 - Basic UI controls are handled locally: queued-message removal/steering, message edit/truncate, read/unread, thread title, retry, cancellation, manual bash invocation, active-error dismissal, and remote executor spawn rejection.
+- Cancellation tracks the active assistant message id. On `client_cancel`, the runtime clears pending tools/approvals, emits a cancelled assistant message when needed, sends a cancelled delta, then sends `agent_state: idle` for the same active message id so Amp CLI status indicators clear after double-Escape cancellation.
 
 ## Persistence, cloud sync, and thread visibility
 

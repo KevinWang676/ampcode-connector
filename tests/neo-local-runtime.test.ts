@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import { cloudThreadFromActor } from "../src/server/neo-cloud-sync.ts";
-import { localFindThreadRun, localReadThreadRun } from "../src/server/neo-local-actor.ts";
+import { LocalThreadActor, localFindThreadRun, localReadThreadRun } from "../src/server/neo-local-actor.ts";
 import { selectModelRoute } from "../src/server/neo-local-inference.ts";
 import { NeoLocalPersistence, type PersistedActorState } from "../src/server/neo-local-persistence.ts";
 import {
@@ -188,6 +188,29 @@ describe("Neo local persistence", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("Neo local cancellation", () => {
+  test("emits a cancelled assistant message and idle state for active inference", () => {
+    const sent: unknown[] = [];
+    const actor = new LocalThreadActor({
+      config: { hostname: "localhost", port: 8765, ampUpstreamUrl: "https://ampcode.com", logLevel: "error", providers: { anthropic: true, codex: true, google: true } },
+      actorId: "actor-cancel-test",
+      threadId: "T-72345678-1234-1234-1234-123456789abc",
+    });
+    const ws = { readyState: WebSocket.OPEN, send: (value: string) => sent.push(JSON.parse(value)) };
+    actor.open(ws as never);
+    sent.length = 0;
+
+    (actor as unknown as { activeAssistantMessageId: string; cancel(): void }).activeAssistantMessageId = "M-activecancel1234567890";
+    (actor as unknown as { cancel(): void }).cancel();
+
+    expect(sent).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "message_added", message: expect.objectContaining({ messageId: "M-activecancel1234567890", state: expect.objectContaining({ type: "cancelled" }) }) }),
+      expect.objectContaining({ type: "delta", messageId: "M-activecancel1234567890", state: "cancelled" }),
+      expect.objectContaining({ type: "agent_state", state: "idle", messageId: "M-activecancel1234567890" }),
+    ]));
   });
 });
 
