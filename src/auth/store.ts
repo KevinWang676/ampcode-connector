@@ -5,7 +5,7 @@
 import { Database, type Statement } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { logger } from "../utils/logger.ts";
 
 export interface Credentials {
@@ -52,7 +52,7 @@ const _dbPath = DEFAULT_DB_PATH;
 function init() {
   if (_stmts) return _stmts;
 
-  const dir = _dbPath.replace(/\/[^/]+$/, "");
+  const dir = dirname(_dbPath);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   _db = new Database(_dbPath, { strict: true });
   _db.exec("PRAGMA journal_mode=WAL");
