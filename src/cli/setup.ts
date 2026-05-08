@@ -46,7 +46,13 @@ function writeJson(path: string, data: Record<string, unknown>): void {
   writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`, "utf-8");
 }
 
-function findAmpApiKey(proxyUrl: string): string | undefined {
+function findAmpApiKey(proxyUrl: string, configKey?: string): string | undefined {
+  // Highest priority: explicit override in config.yaml. This is the user's
+  // declared "preferred account" — honor it over whatever was last left in
+  // secrets.json by `amp login`. Otherwise setup would silently bind the
+  // proxy URL to a stale account and Amp CLI would display the wrong user.
+  if (configKey) return configKey;
+
   if (process.env.AMP_API_KEY) return process.env.AMP_API_KEY;
 
   const secrets = readJson(AMP_SECRETS_PATH);
@@ -68,6 +74,22 @@ function saveAmpApiKey(token: string, proxyUrl: string): void {
   secrets[`apiKey@${proxyUrl}`] = token;
   mkdirSync(AMP_SECRETS_DIR, { recursive: true, mode: 0o700 });
   writeJson(AMP_SECRETS_PATH, secrets);
+}
+
+/**
+ * If config.yaml declares an `ampApiKey`, ensure ~/.local/share/amp/secrets.json
+ * has the matching `apiKey@<proxyUrl>` entry. Without this, Amp CLI's local
+ * account display can disagree with the account the proxy actually authenticates
+ * as upstream — the user sees the "wrong" account even though API calls succeed.
+ *
+ * Returns true when secrets.json was updated.
+ */
+export function syncAmpApiKey(configKey: string | undefined, proxyUrl: string): boolean {
+  if (!configKey) return false;
+  const secrets = readJson(AMP_SECRETS_PATH);
+  if (secrets[`apiKey@${proxyUrl}`] === configKey) return false;
+  saveAmpApiKey(configKey, proxyUrl);
+  return true;
 }
 
 function prompt(question: string): Promise<string> {
@@ -111,7 +133,7 @@ export async function setup(): Promise<void> {
   warnLegacySettingsFile();
 
   // Step 2: Amp API key
-  const existingKey = findAmpApiKey(proxyUrl);
+  const existingKey = findAmpApiKey(proxyUrl, config.ampApiKey);
 
   if (existingKey) {
     saveAmpApiKey(existingKey, proxyUrl);

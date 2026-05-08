@@ -7,7 +7,7 @@ import type { OAuthConfig } from "./auth/oauth.ts";
 import * as oauth from "./auth/oauth.ts";
 import { bannerAd } from "./cli/ads.ts";
 import { line, s } from "./cli/ansi.ts";
-import { setup } from "./cli/setup.ts";
+import { setup, syncAmpApiKey } from "./cli/setup.ts";
 import * as status from "./cli/status.ts";
 import { dashboard } from "./cli/tui.ts";
 import { loadConfig, type ProxyConfig } from "./config/config.ts";
@@ -44,6 +44,15 @@ async function main(): Promise<void> {
 
   const config = await loadConfig();
   setLogLevel(config.logLevel);
+
+  // Keep ~/.local/share/amp/secrets.json in sync with config.yaml's ampApiKey
+  // so Amp CLI's local account display matches the account the proxy
+  // authenticates as upstream.
+  const proxyUrl = `http://localhost:${config.port}`;
+  if (syncAmpApiKey(config.ampApiKey, proxyUrl)) {
+    logger.info(`Synced Amp API key from config.yaml to secrets.json (apiKey@${proxyUrl})`);
+  }
+
   startServer(config);
   startAutoRefresh();
   banner(config);
