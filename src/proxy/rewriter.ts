@@ -6,6 +6,7 @@
  */
 
 import { modelFieldPaths } from "../constants.ts";
+import { unrewriteAnthropicResponseToolNames } from "../utils/tool-names.ts";
 
 /** Pre-split field paths — avoids .split(".") on every SSE chunk. */
 const MODEL_FIELD_PARTS = modelFieldPaths.map((p) => p.split("."));
@@ -26,6 +27,7 @@ export function rewrite(originalModel: string): (data: string) => string {
         }
       }
 
+      if (unrewriteAnthropicResponseToolNames(parsed)) modified = true;
       if (suppressThinking(parsed)) modified = true;
 
       return modified ? JSON.stringify(parsed) : data;

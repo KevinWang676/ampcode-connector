@@ -353,7 +353,9 @@ describe("prepareAnthropicBody", () => {
     const prepared = JSON.parse(prepareAnthropicBody(body)) as Record<string, unknown>;
     expect(prepared.thinking).toBeUndefined();
     expect(prepared.speed).toBeUndefined();
-    expect(prepared.tool_choice).toEqual({ type: "tool", name: "create_handoff_context" });
+    // tool_choice.name is rewritten to the Claude Code MCP convention so api.anthropic.com
+    // bills against the Max subscription. The response rewriter strips the prefix back.
+    expect(prepared.tool_choice).toEqual({ type: "tool", name: "mcp__amp__create_handoff_context" });
   });
 
   test("keeps thinking when tool_choice is auto", () => {

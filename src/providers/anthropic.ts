@@ -6,6 +6,7 @@ import * as oauth from "../auth/oauth.ts";
 import * as store from "../auth/store.ts";
 import { ANTHROPIC_API_URL, CLAUDE_CODE_VERSION, claudeCodeBetas, filteredBetaFeatures } from "../constants.ts";
 import type { ParsedBody } from "../server/body.ts";
+import { rewriteAnthropicRequestToolNames } from "../utils/tool-names.ts";
 import type { Provider } from "./base.ts";
 import { denied, forward } from "./forward.ts";
 
@@ -125,6 +126,7 @@ export function prepareBody(body: ParsedBody, userId?: string): string {
       system: injectClaudeCodeSystem(existingSystem, billingLine),
     };
 
+    rewriteAnthropicRequestToolNames(prepared);
     stripThinkingIfToolChoiceForced(prepared);
 
     return JSON.stringify(prepared);
