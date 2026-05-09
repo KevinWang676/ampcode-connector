@@ -4,7 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { cloudThreadFromActor } from "../src/server/neo-cloud-sync.ts";
 import { LocalThreadActor, localFindThreadRun, localReadThreadRun } from "../src/server/neo-local-actor.ts";
-import { anthropicMaxOutputTokens, parseAnthropicSse, selectModelRoute } from "../src/server/neo-local-inference.ts";
+import {
+  anthropicMaxOutputTokens,
+  googleMaxOutputTokens,
+  parseAnthropicSse,
+  parseOpenAISse,
+  selectModelRoute,
+} from "../src/server/neo-local-inference.ts";
 import { NeoLocalPersistence, type PersistedActorState } from "../src/server/neo-local-persistence.ts";
 import {
   actorRecord,
@@ -347,12 +353,18 @@ describe("Neo local model routing", () => {
   });
 });
 
-describe("Neo Anthropic max_tokens caps", () => {
-  test("uses model-specific output ceilings well above the old 8192 cap", () => {
+describe("Neo provider max_tokens caps", () => {
+  test("Anthropic uses model-specific output ceilings well above the old 8192 cap", () => {
     expect(anthropicMaxOutputTokens("claude-haiku-4-5-20251001")).toBeGreaterThanOrEqual(32000);
     expect(anthropicMaxOutputTokens("claude-opus-4-7")).toBeGreaterThanOrEqual(32000);
     expect(anthropicMaxOutputTokens("claude-opus-4-6")).toBeGreaterThanOrEqual(32000);
     expect(anthropicMaxOutputTokens("unknown-future-model")).toBeGreaterThanOrEqual(32000);
+  });
+
+  test("Google sets an explicit maxOutputTokens above the legacy 8192 default", () => {
+    expect(googleMaxOutputTokens("gemini-3-pro-preview")).toBeGreaterThanOrEqual(32000);
+    expect(googleMaxOutputTokens("gemini-2.5-flash")).toBeGreaterThanOrEqual(32000);
+    expect(googleMaxOutputTokens("unknown-future-gemini")).toBeGreaterThanOrEqual(32000);
   });
 });
 
@@ -440,5 +452,88 @@ describe("Neo Anthropic SSE parser", () => {
     expect(typeof input.error).toBe("string");
     expect(String(input.error)).toContain("max_tokens");
     expect(input.partial).toBe(truncated);
+  });
+});
+
+describe("Neo OpenAI SSE parser", () => {
+  function sseResponse(events: Array<Record<string, unknown>>): Response {
+    const body = `${events.map((e) => `data: ${JSON.stringify(e)}`).join("\n\n")}\n\ndata: [DONE]\n\n`;
+    return new Response(body, { headers: { "Content-Type": "text/event-stream" } });
+  }
+
+  test("reassembles tool_calls.function.arguments across many deltas (>8192 chars)", async () => {
+    const bigContent = "print('hello world')\n".repeat(600);
+    const fullArgs = JSON.stringify({ path: "/tmp/big.py", content: bigContent });
+    expect(fullArgs.length).toBeGreaterThan(8192);
+
+    const events: Array<Record<string, unknown>> = [
+      {
+        choices: [
+          {
+            index: 0,
+            delta: {
+              role: "assistant",
+              tool_calls: [{ index: 0, id: "call_test_1", type: "function", function: { name: "create_file", arguments: "" } }],
+            },
+            finish_reason: null,
+          },
+        ],
+      },
+    ];
+
+    const chunkSize = 512;
+    for (let i = 0; i < fullArgs.length; i += chunkSize) {
+      events.push({
+        choices: [
+          {
+            index: 0,
+            delta: { tool_calls: [{ index: 0, function: { arguments: fullArgs.slice(i, i + chunkSize) } }] },
+            finish_reason: null,
+          },
+        ],
+      });
+    }
+    events.push({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] });
+
+    const result = await parseOpenAISse(sseResponse(events), "gpt-5.5", {});
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.toolCalls[0]?.name).toBe("create_file");
+    expect(result.toolCalls[0]?.input).toEqual({ path: "/tmp/big.py", content: bigContent });
+    expect(result.toolCalls[0]?.input.error).toBeUndefined();
+  });
+
+  test("surfaces a structured error when finish_reason=length truncates the tool input", async () => {
+    const partial = '{"path":"/tmp/big.py","content":"def f0():\\n    print(0)\\n';
+    const events: Array<Record<string, unknown>> = [
+      {
+        choices: [
+          {
+            index: 0,
+            delta: {
+              role: "assistant",
+              tool_calls: [{ index: 0, id: "call_trunc_1", type: "function", function: { name: "create_file", arguments: "" } }],
+            },
+            finish_reason: null,
+          },
+        ],
+      },
+      {
+        choices: [
+          {
+            index: 0,
+            delta: { tool_calls: [{ index: 0, function: { arguments: partial } }] },
+            finish_reason: null,
+          },
+        ],
+      },
+      { choices: [{ index: 0, delta: {}, finish_reason: "length" }] },
+    ];
+
+    const result = await parseOpenAISse(sseResponse(events), "gpt-5.5", {});
+    expect(result.toolCalls).toHaveLength(1);
+    const input = result.toolCalls[0]?.input as Record<string, unknown>;
+    expect(typeof input.error).toBe("string");
+    expect(String(input.error)).toContain("truncated");
+    expect(input.partial).toBe(partial);
   });
 });

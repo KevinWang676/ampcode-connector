@@ -405,7 +405,7 @@ async function inferOpenAI(
   return parseOpenAISse(response, route.model, handler, request.signal);
 }
 
-async function parseOpenAISse(
+export async function parseOpenAISse(
   response: Response,
   model: string,
   handler: InferenceStreamHandler,
@@ -414,6 +414,7 @@ async function parseOpenAISse(
   let text = "";
   const toolByIndex = new Map<number, { id: string; name: string; argsBuf: string; started: boolean }>();
   let usage: JsonRecord = {};
+  let finishReason: string | undefined;
 
   await readSseChunks(
     response,
@@ -461,6 +462,9 @@ async function parseOpenAISse(
             if (entry.started) handler.onToolInputDelta?.(entry.id, fn.arguments);
           }
         }
+        if (typeof choice.finish_reason === "string" && choice.finish_reason) {
+          finishReason = choice.finish_reason;
+        }
       }
 
       const u = jsonRecord(event.usage);
@@ -471,10 +475,50 @@ async function parseOpenAISse(
 
   const toolCalls: LocalInferenceResult["toolCalls"] = [...toolByIndex.entries()]
     .sort(([a], [b]) => a - b)
-    .map(([, entry]) => ({ id: entry.id, name: entry.name, input: parseToolArguments(entry.argsBuf) }));
+    .map(([, entry]) => {
+      // parseToolArguments falls back to {input: raw} on JSON.parse failure.
+      // When the upstream truncated the response (finish_reason=length), surface
+      // a structured error so the AMP CLI doesn't dispatch a tool call with
+      // garbage arguments.
+      const parsed = parseToolArguments(entry.argsBuf);
+      const looksTruncated =
+        finishReason === "length" &&
+        entry.argsBuf.length > 0 &&
+        (Object.keys(parsed).length === 0 || (Object.keys(parsed).length === 1 && typeof parsed.input === "string"));
+      if (looksTruncated) {
+        logger.warn(
+          `OpenAI tool input truncated: tool=${entry.name} id=${entry.id} model=${model} finish_reason=length partialBytes=${entry.argsBuf.length}`,
+        );
+        return {
+          id: entry.id,
+          name: entry.name,
+          input: {
+            error:
+              "tool_input_truncated_max_tokens: model output hit the response length cap before tool JSON closed; raise max_output_tokens or shrink the request",
+            partial: entry.argsBuf,
+          },
+        };
+      }
+      return { id: entry.id, name: entry.name, input: parsed };
+    });
+
+  if (finishReason === "length") {
+    logger.warn(
+      `OpenAI response stopped at finish_reason=length model=${model} — large outputs (e.g. file contents) may be truncated.`,
+    );
+  }
 
   if (Object.keys(usage).length) handler.onUsage?.(usage);
   return { provider: "openai", model, text, toolCalls, usage };
+}
+
+/** Output-token ceiling for Gemini models. Older Gemini-1.5 defaulted to 8192,
+ *  which would silently truncate large tool inputs (the same failure class the
+ *  Anthropic 8192 cap caused). Gemini-2.5/3 models accept up to 65536 output
+ *  tokens, so we explicitly request 32768 — well above any sane file-write tool
+ *  invocation but within every supported model's hard ceiling. */
+export function googleMaxOutputTokens(_model: string): number {
+  return 32768;
 }
 
 async function inferGoogle(
@@ -486,6 +530,7 @@ async function inferGoogle(
   const streaming = !!handler;
   const body = {
     contents: googleContents(request.history, systemPrompt(request)),
+    generationConfig: { maxOutputTokens: googleMaxOutputTokens(route.model) },
     ...(request.tools.length > 0
       ? { tools: [{ functionDeclarations: request.tools.map(toGoogleFunctionDeclaration) }] }
       : {}),
