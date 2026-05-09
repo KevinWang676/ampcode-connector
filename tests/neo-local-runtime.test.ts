@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { cloudThreadFromActor } from "../src/server/neo-cloud-sync.ts";
 import { LocalThreadActor, localFindThreadRun, localReadThreadRun } from "../src/server/neo-local-actor.ts";
-import { selectModelRoute } from "../src/server/neo-local-inference.ts";
+import { anthropicMaxOutputTokens, parseAnthropicSse, selectModelRoute } from "../src/server/neo-local-inference.ts";
 import { NeoLocalPersistence, type PersistedActorState } from "../src/server/neo-local-persistence.ts";
 import {
   actorRecord,
@@ -344,5 +344,101 @@ describe("Neo local model routing", () => {
       provider: "openai",
       model: "gpt-5.4",
     });
+  });
+});
+
+describe("Neo Anthropic max_tokens caps", () => {
+  test("uses model-specific output ceilings well above the old 8192 cap", () => {
+    expect(anthropicMaxOutputTokens("claude-haiku-4-5-20251001")).toBeGreaterThanOrEqual(32000);
+    expect(anthropicMaxOutputTokens("claude-opus-4-7")).toBeGreaterThanOrEqual(32000);
+    expect(anthropicMaxOutputTokens("claude-opus-4-6")).toBeGreaterThanOrEqual(32000);
+    expect(anthropicMaxOutputTokens("unknown-future-model")).toBeGreaterThanOrEqual(32000);
+  });
+});
+
+describe("Neo Anthropic SSE parser", () => {
+  function buildSse(events: Array<Record<string, unknown>>): string {
+    return `${events.map((e) => `data: ${JSON.stringify(e)}`).join("\n\n")}\n\n`;
+  }
+
+  function sseResponse(body: string): Response {
+    return new Response(body, { headers: { "Content-Type": "text/event-stream" } });
+  }
+
+  test("reassembles tool_use input across many input_json_delta chunks (>8192 chars)", async () => {
+    // Simulate a create_file invocation whose `content` field is ~12 KB —
+    // larger than the historical 8192-token cap and large enough to be split
+    // across many input_json_delta events. Asserts the parser stitches them
+    // back into valid JSON.
+    const bigContent = "print('hello world')\n".repeat(600);
+    const fullInput = JSON.stringify({ path: "/tmp/big.py", content: bigContent });
+    expect(fullInput.length).toBeGreaterThan(8192);
+
+    const events: Array<Record<string, unknown>> = [
+      { type: "message_start", message: { usage: { input_tokens: 10, output_tokens: 0 } } },
+      {
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "tool_use", id: "toolu_test_1", name: "create_file", input: {} },
+      },
+    ];
+
+    const chunkSize = 512;
+    for (let i = 0; i < fullInput.length; i += chunkSize) {
+      events.push({
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "input_json_delta", partial_json: fullInput.slice(i, i + chunkSize) },
+      });
+    }
+
+    events.push({ type: "content_block_stop", index: 0 });
+    events.push({
+      type: "message_delta",
+      delta: { stop_reason: "end_turn", stop_sequence: null },
+      usage: { output_tokens: 5000 },
+    });
+    events.push({ type: "message_stop" });
+
+    const result = await parseAnthropicSse(sseResponse(buildSse(events)), "claude-opus-4-7", {});
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.toolCalls[0]?.name).toBe("create_file");
+    expect(result.toolCalls[0]?.input).toEqual({ path: "/tmp/big.py", content: bigContent });
+    expect(result.toolCalls[0]?.input.error).toBeUndefined();
+    expect(result.toolCalls[0]?.input.partial).toBeUndefined();
+  });
+
+  test("surfaces a structured error when stop_reason=max_tokens truncates the tool input", async () => {
+    // Simulate the original failure mode: the model emits a partial JSON for
+    // create_file but the response is cut off by max_tokens before the closing
+    // braces and content_block_stop arrive.
+    const truncated = '{"path":"/tmp/big.py","content":"def f0():\\n    print(0)\\n';
+    const events: Array<Record<string, unknown>> = [
+      { type: "message_start", message: { usage: { input_tokens: 10, output_tokens: 0 } } },
+      {
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "tool_use", id: "toolu_trunc_1", name: "create_file", input: {} },
+      },
+      {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "input_json_delta", partial_json: truncated },
+      },
+      // No content_block_stop — stream cut off.
+      {
+        type: "message_delta",
+        delta: { stop_reason: "max_tokens", stop_sequence: null },
+        usage: { output_tokens: 8192 },
+      },
+      { type: "message_stop" },
+    ];
+
+    const result = await parseAnthropicSse(sseResponse(buildSse(events)), "claude-opus-4-7", {});
+    expect(result.toolCalls).toHaveLength(1);
+    const input = result.toolCalls[0]?.input as Record<string, unknown>;
+    expect(typeof input.error).toBe("string");
+    expect(String(input.error)).toContain("max_tokens");
+    expect(input.partial).toBe(truncated);
   });
 });

@@ -152,6 +152,18 @@ export function selectModelRoute(agentMode: string, settings: JsonRecord): Model
   }
 }
 
+/** Output-token ceilings per Anthropic model family.
+ *  Hard-coded 8192 was truncating large tool_use inputs (e.g. create_file with
+ *  multi-thousand-line content) mid-stream, causing the AMP CLI to receive
+ *  empty/partial JSON. Use each model's real max output to avoid that. */
+export function anthropicMaxOutputTokens(model: string): number {
+  const m = model.toLowerCase();
+  if (m.includes("claude-haiku")) return 64000;
+  if (m.includes("claude-opus")) return 32000;
+  if (m.includes("claude-sonnet")) return 32000;
+  return 32000;
+}
+
 async function inferAnthropic(
   config: ProxyConfig,
   request: LocalInferenceRequest,
@@ -161,7 +173,7 @@ async function inferAnthropic(
   const streaming = !!handler;
   const body = {
     model: route.model,
-    max_tokens: 8192,
+    max_tokens: anthropicMaxOutputTokens(route.model),
     stream: streaming,
     system: [{ type: "text", text: systemPrompt(request) }],
     messages: anthropicMessages(request.history),
@@ -206,7 +218,7 @@ function collectAnthropicJson(json: JsonRecord, model: string): LocalInferenceRe
   return { provider: "anthropic", model, text, toolCalls, usage: jsonRecord(json.usage) };
 }
 
-async function parseAnthropicSse(
+export async function parseAnthropicSse(
   response: Response,
   model: string,
   handler: InferenceStreamHandler,
@@ -217,6 +229,7 @@ async function parseAnthropicSse(
   const toolCallByIndex = new Map<number, LocalInferenceResult["toolCalls"][number]>();
   const partialJsonByIndex = new Map<number, string>();
   let usage: JsonRecord = {};
+  let stopReason: string | undefined;
 
   await readSseChunks(
     response,
@@ -229,6 +242,8 @@ async function parseAnthropicSse(
         const message = jsonRecord(event.message);
         const u = jsonRecord(message.usage);
         if (Object.keys(u).length) usage = { ...usage, ...u };
+        const msgStopReason = message.stop_reason;
+        if (typeof msgStopReason === "string") stopReason = msgStopReason;
         return;
       }
 
@@ -273,15 +288,23 @@ async function parseAnthropicSse(
           if (partial) {
             try {
               call.input = jsonRecord(JSON.parse(partial));
+              partialJsonByIndex.delete(index);
             } catch {
-              call.input = { raw: partial };
+              // Leave the partial buffer in place; final reconciliation below
+              // decides whether this is a max_tokens truncation or a true parse
+              // error and surfaces the right diagnostic.
             }
+          } else {
+            partialJsonByIndex.delete(index);
           }
         }
         return;
       }
 
       if (type === "message_delta") {
+        const delta = jsonRecord(event.delta);
+        const deltaStopReason = delta.stop_reason;
+        if (typeof deltaStopReason === "string") stopReason = deltaStopReason;
         const u = jsonRecord(event.usage);
         if (Object.keys(u).length) usage = { ...usage, ...u };
         return;
@@ -289,6 +312,37 @@ async function parseAnthropicSse(
     },
     signal,
   );
+
+  // Final reconciliation: any tool_use block whose JSON could not be parsed
+  // either lost its content_block_stop (mid-stream max_tokens) or contained
+  // invalid JSON. Surface a structured error so the AMP CLI sees the failure
+  // mode instead of an empty {} or opaque {raw: ...} input.
+  for (const [index, call] of toolCallByIndex) {
+    const partial = partialJsonByIndex.get(index);
+    if (!partial) continue;
+    try {
+      call.input = jsonRecord(JSON.parse(partial));
+    } catch {
+      const truncated = stopReason === "max_tokens";
+      logger.warn(
+        truncated
+          ? `Anthropic tool input truncated: tool=${call.name} id=${call.id} model=${model} stop_reason=max_tokens partialBytes=${partial.length}`
+          : `Anthropic tool input invalid JSON: tool=${call.name} id=${call.id} model=${model} partialBytes=${partial.length}`,
+      );
+      call.input = {
+        error: truncated
+          ? "tool_input_truncated_max_tokens: model output hit max_tokens before tool JSON closed; raise max_tokens or shrink the request"
+          : "tool_input_invalid_json: model emitted partial JSON that could not be parsed",
+        partial,
+      };
+    }
+  }
+
+  if (stopReason === "max_tokens") {
+    logger.warn(
+      `Anthropic response stopped at max_tokens model=${model} — large tool inputs (e.g. file contents) may be truncated. Consider raising max_tokens or splitting the request.`,
+    );
+  }
 
   if (Object.keys(usage).length) handler.onUsage?.(usage);
   return { provider: "anthropic", model, text, toolCalls, usage };
