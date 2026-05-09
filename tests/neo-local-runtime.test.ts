@@ -1,16 +1,16 @@
+import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, test } from "bun:test";
 import { cloudThreadFromActor } from "../src/server/neo-cloud-sync.ts";
 import { LocalThreadActor, localFindThreadRun, localReadThreadRun } from "../src/server/neo-local-actor.ts";
 import { selectModelRoute } from "../src/server/neo-local-inference.ts";
 import { NeoLocalPersistence, type PersistedActorState } from "../src/server/neo-local-persistence.ts";
 import {
+  actorRecord,
   decodeThreadMessage,
   encodeThreadMessage,
   extractThreadIdFromActorBody,
-  actorRecord,
   normalizeNeoUsage,
   normalizeToolCallId,
 } from "../src/server/neo-protocol.ts";
@@ -109,8 +109,16 @@ describe("Neo local persistence", () => {
       const store = new NeoLocalPersistence(dir);
       const targetThreadId = "T-32345678-1234-1234-1234-123456789abc";
       const currentThreadId = "T-42345678-1234-1234-1234-123456789abc";
-      store.importCloudThread({ id: targetThreadId, title: "Target", messages: [{ role: "user", content: [{ type: "text", text: "target content" }] }] });
-      store.importCloudThread({ id: currentThreadId, title: "Current", messages: [{ role: "user", content: [{ type: "text", text: "current content" }] }] });
+      store.importCloudThread({
+        id: targetThreadId,
+        title: "Target",
+        messages: [{ role: "user", content: [{ type: "text", text: "target content" }] }],
+      });
+      store.importCloudThread({
+        id: currentThreadId,
+        title: "Current",
+        messages: [{ role: "user", content: [{ type: "text", text: "current content" }] }],
+      });
 
       const run = await localReadThreadRun({ threadID: `https://ampcode.com/threads/${targetThreadId}` }, store);
       expect(run?.threadID).toBe(targetThreadId);
@@ -131,8 +139,20 @@ describe("Neo local persistence", () => {
         id: threadId,
         title: "Huge Thread",
         messages: [
-          { role: "assistant", content: [{ type: "thinking", thinking: "x".repeat(200_000), signature: "gAAAAAB" + "x".repeat(1_000) }] },
-          { role: "user", content: [{ type: "tool_result", toolUseID: "TU-1", run: { output: `<loaded_skill name="x">${"skill".repeat(20_000)}</loaded_skill> useful result` } }] },
+          {
+            role: "assistant",
+            content: [{ type: "thinking", thinking: "x".repeat(200_000), signature: `gAAAAAB${"x".repeat(1_000)}` }],
+          },
+          {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                toolUseID: "TU-1",
+                run: { output: `<loaded_skill name="x">${"skill".repeat(20_000)}</loaded_skill> useful result` },
+              },
+            ],
+          },
         ],
       });
 
@@ -151,11 +171,17 @@ describe("Neo local persistence", () => {
     try {
       const store = new NeoLocalPersistence(dir);
       const threadId = "T-52345678-1234-1234-1234-123456789abc";
-      store.importCloudThread({ id: threadId, title: "Needle Thread", messages: [{ role: "user", content: [{ type: "text", text: "unique needle phrase" }] }] });
+      store.importCloudThread({
+        id: threadId,
+        title: "Needle Thread",
+        messages: [{ role: "user", content: [{ type: "text", text: "unique needle phrase" }] }],
+      });
 
       const run = localFindThreadRun({ query: "needle", limit: 5 }, store);
       expect(run?.result).toContain(threadId);
-      expect(run?.threads).toEqual(expect.arrayContaining([expect.objectContaining({ id: threadId, title: "Needle Thread" })]));
+      expect(run?.threads).toEqual(
+        expect.arrayContaining([expect.objectContaining({ id: threadId, title: "Needle Thread" })]),
+      );
       expect(localFindThreadRun({ query: "missing", limit: 5 }, store)).toBeNull();
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -175,8 +201,17 @@ describe("Neo local persistence", () => {
         env: { initial: { workspaceRoot: "/repo" } },
         meta: { visibility: "private" },
         messages: [
-          { role: "user", messageId: "M-2234567890123456789011", content: [{ type: "text", text: "download me" }], agentMode: "large" },
-          { role: "assistant", messageId: "M-2234567890123456789012", content: [{ type: "text", text: "synced locally" }] },
+          {
+            role: "user",
+            messageId: "M-2234567890123456789011",
+            content: [{ type: "text", text: "download me" }],
+            agentMode: "large",
+          },
+          {
+            role: "assistant",
+            messageId: "M-2234567890123456789012",
+            content: [{ type: "text", text: "synced locally" }],
+          },
         ],
       });
 
@@ -195,7 +230,13 @@ describe("Neo local cancellation", () => {
   test("emits a cancelled assistant message and idle state for active inference", () => {
     const sent: unknown[] = [];
     const actor = new LocalThreadActor({
-      config: { hostname: "localhost", port: 8765, ampUpstreamUrl: "https://ampcode.com", logLevel: "error", providers: { anthropic: true, codex: true, google: true } },
+      config: {
+        hostname: "localhost",
+        port: 8765,
+        ampUpstreamUrl: "https://ampcode.com",
+        logLevel: "error",
+        providers: { anthropic: true, codex: true, google: true },
+      },
       actorId: "actor-cancel-test",
       threadId: "T-72345678-1234-1234-1234-123456789abc",
     });
@@ -203,14 +244,23 @@ describe("Neo local cancellation", () => {
     actor.open(ws as never);
     sent.length = 0;
 
-    (actor as unknown as { activeAssistantMessageId: string; cancel(): void }).activeAssistantMessageId = "M-activecancel1234567890";
+    (actor as unknown as { activeAssistantMessageId: string; cancel(): void }).activeAssistantMessageId =
+      "M-activecancel1234567890";
     (actor as unknown as { cancel(): void }).cancel();
 
-    expect(sent).toEqual(expect.arrayContaining([
-      expect.objectContaining({ type: "message_added", message: expect.objectContaining({ messageId: "M-activecancel1234567890", state: expect.objectContaining({ type: "cancelled" }) }) }),
-      expect.objectContaining({ type: "delta", messageId: "M-activecancel1234567890", state: "cancelled" }),
-      expect.objectContaining({ type: "agent_state", state: "idle", messageId: "M-activecancel1234567890" }),
-    ]));
+    expect(sent).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "message_added",
+          message: expect.objectContaining({
+            messageId: "M-activecancel1234567890",
+            state: expect.objectContaining({ type: "cancelled" }),
+          }),
+        }),
+        expect.objectContaining({ type: "delta", messageId: "M-activecancel1234567890", state: "cancelled" }),
+        expect.objectContaining({ type: "agent_state", state: "idle", messageId: "M-activecancel1234567890" }),
+      ]),
+    );
   });
 });
 
@@ -230,8 +280,21 @@ describe("Neo cloud sync shape", () => {
         threadId,
         settings: {},
         messages: [
-          { threadId, role: "user", agentMode: "deep", messageId: "M-1234567890123456789011", content: [{ type: "text", text: "first deep turn" }], seq: 3 },
-          { threadId, role: "assistant", messageId: "M-1234567890123456789012", content: [{ type: "text", text: "cloud sync" }], seq: 4 },
+          {
+            threadId,
+            role: "user",
+            agentMode: "deep",
+            messageId: "M-1234567890123456789011",
+            content: [{ type: "text", text: "first deep turn" }],
+            seq: 3,
+          },
+          {
+            threadId,
+            role: "assistant",
+            messageId: "M-1234567890123456789012",
+            content: [{ type: "text", text: "cloud sync" }],
+            seq: 4,
+          },
         ],
         history: [{ role: "assistant", text: "cloud sync" }],
         queue: [],
@@ -244,9 +307,23 @@ describe("Neo cloud sync shape", () => {
     };
 
     const cloud = cloudThreadFromActor(actor);
-    expect(cloud).toMatchObject({ id: threadId, v: 5, title: "Cloud sync", agentMode: "deep", meta: { ampcodeConnectorLocalNeo: true } });
+    expect(cloud).toMatchObject({
+      id: threadId,
+      v: 5,
+      title: "Cloud sync",
+      agentMode: "deep",
+      meta: { ampcodeConnectorLocalNeo: true },
+    });
     expect(cloud.messages).toEqual(
-      expect.arrayContaining([{ role: "assistant", content: [{ type: "text", text: "cloud sync" }], state: { type: "complete", stopReason: "end_turn" }, messageId: "M-1234567890123456789012", protocolMessageID: "M-1234567890123456789012" }]),
+      expect.arrayContaining([
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "cloud sync" }],
+          state: { type: "complete", stopReason: "end_turn" },
+          messageId: "M-1234567890123456789012",
+          protocolMessageID: "M-1234567890123456789012",
+        },
+      ]),
     );
   });
 });

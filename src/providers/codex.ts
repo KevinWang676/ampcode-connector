@@ -34,7 +34,7 @@ export const provider: Provider = {
 
   accountCount: () => oauth.accountCount(config),
 
-  async forward(sub, body, originalHeaders, rewrite, account = 0) {
+  async forward(sub, body, originalHeaders, rewrite, account = 0, _proxyConfig, signal) {
     // 1. AUTH
     const accessToken = await oauth.token(config, account);
     if (!accessToken) return denied("OpenAI Codex");
@@ -66,6 +66,7 @@ export const provider: Provider = {
       providerName: "OpenAI Codex",
       rewrite: needsResponseTransform ? undefined : rewrite,
       email: store.get("codex", account)?.email,
+      signal,
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${accessToken}`,

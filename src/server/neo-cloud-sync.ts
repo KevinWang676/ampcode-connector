@@ -2,7 +2,7 @@ import { gzipSync } from "node:zlib";
 import type { ProxyConfig } from "../config/config.ts";
 import { logger } from "../utils/logger.ts";
 import type { PersistedActorState } from "./neo-local-persistence.ts";
-import { jsonRecord, textFromBlocks, type JsonRecord, type NeoThreadMessage } from "./neo-protocol.ts";
+import { type JsonRecord, jsonRecord, type NeoThreadMessage, textFromBlocks } from "./neo-protocol.ts";
 
 const UPLOAD_DEBOUNCE_MS = 750;
 const GZIP_THRESHOLD_BYTES = 10 * 1024 * 1024;
@@ -49,7 +49,11 @@ export class NeoCloudSync {
     const thread = cloudThreadFromActor(actor);
     try {
       const json = await this.callInternal("uploadThread", { thread, createdOnServer: false });
-      logger.info("Synced local Neo thread to Amp cloud", { threadID: actor.snapshot.threadId, version: thread.v, ok: json.ok });
+      logger.info("Synced local Neo thread to Amp cloud", {
+        threadID: actor.snapshot.threadId,
+        version: thread.v,
+        ok: json.ok,
+      });
     } catch (err) {
       logger.warn("Failed to sync local Neo thread to Amp cloud", {
         threadID: actor.snapshot.threadId,
@@ -95,10 +99,12 @@ export function cloudThreadFromActor(actor: PersistedActorState): JsonRecord {
 }
 
 function cloudEnvironment(environment: JsonRecord): JsonRecord | undefined {
-  const trees = Array.isArray(environment.trees) ? environment.trees.map((tree) => {
-    const item = jsonRecord(tree);
-    return { repository: item.repository, displayName: item.displayName, uri: item.uri };
-  }) : undefined;
+  const trees = Array.isArray(environment.trees)
+    ? environment.trees.map((tree) => {
+        const item = jsonRecord(tree);
+        return { repository: item.repository, displayName: item.displayName, uri: item.uri };
+      })
+    : undefined;
   const initial: JsonRecord = {
     ...(trees ? { trees } : {}),
     ...(typeof environment.platform === "string" ? { platform: environment.platform } : {}),
@@ -110,7 +116,8 @@ function cloudEnvironment(environment: JsonRecord): JsonRecord | undefined {
 
 function cloudAgentMode(snapshot: PersistedActorState["snapshot"]): string | undefined {
   if (typeof snapshot.settings.agentMode === "string") return snapshot.settings.agentMode;
-  return snapshot.messages.find((message) => message.role === "user" && typeof message.agentMode === "string")?.agentMode;
+  return snapshot.messages.find((message) => message.role === "user" && typeof message.agentMode === "string")
+    ?.agentMode;
 }
 
 function cloudMessageFromNeo(message: NeoThreadMessage & { seq: number }): JsonRecord {
@@ -126,7 +133,10 @@ function cloudMessageFromNeo(message: NeoThreadMessage & { seq: number }): JsonR
     if (message.agentMode) base.agentMode = message.agentMode;
   }
   if (message.role === "assistant") {
-    base.state = message.state ?? { type: "complete", stopReason: message.content.some((block) => isToolUse(block)) ? "tool_use" : "end_turn" };
+    base.state = message.state ?? {
+      type: "complete",
+      stopReason: message.content.some((block) => isToolUse(block)) ? "tool_use" : "end_turn",
+    };
     if (message.usage) base.usage = message.usage;
   }
   if (message.createdAt) base.createdAt = message.createdAt;
@@ -141,7 +151,9 @@ function titleFromMessages(messages: Array<NeoThreadMessage & { seq: number }>):
 }
 
 function isToolUse(value: unknown): boolean {
-  return typeof value === "object" && value !== null && "type" in value && (value as { type?: unknown }).type === "tool_use";
+  return (
+    typeof value === "object" && value !== null && "type" in value && (value as { type?: unknown }).type === "tool_use"
+  );
 }
 
 function gzipPayload(payload: string, headers: Record<string, string>): Uint8Array {

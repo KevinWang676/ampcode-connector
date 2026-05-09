@@ -1,9 +1,10 @@
 /** Unified Google provider — merges Gemini CLI and Antigravity strategies
  *  with internal fallback. Tries preferred strategy first, then falls back. */
 
-import { google as config } from "../auth/configs.ts";
+import { google as oauthConfig } from "../auth/configs.ts";
 import * as oauth from "../auth/oauth.ts";
 import * as store from "../auth/store.ts";
+import type { ProxyConfig } from "../config/config.ts";
 import { ANTIGRAVITY_DAILY_ENDPOINT, ANTIGRAVITY_DAILY_SANDBOX_ENDPOINT, CODE_ASSIST_ENDPOINT } from "../constants.ts";
 import { buildUrl, maybeWrap, withUnwrap } from "../utils/code-assist.ts";
 import { logger } from "../utils/logger.ts";
@@ -20,6 +21,7 @@ const GOOGLE_CLIENT_METADATA = JSON.stringify({
 
 interface GoogleStrategy {
   name: string;
+  auth: "oauth" | "apiKey";
   headers: Readonly<Record<string, string>>;
   endpoints: readonly string[];
   modelMapper?: (model: string) => string;
@@ -32,12 +34,27 @@ interface GoogleStrategy {
 
 const geminiStrategy: GoogleStrategy = {
   name: "gemini",
+  auth: "oauth",
   headers: {
     "User-Agent": "google-cloud-sdk vscode_cloudshelleditor/0.1",
     "X-Goog-Api-Client": "gl-node/22.17.0",
     "Client-Metadata": GOOGLE_CLIENT_METADATA,
   },
   endpoints: [CODE_ASSIST_ENDPOINT],
+  wrapOpts: {
+    userAgent: "pi-coding-agent",
+    requestIdPrefix: "pi",
+  },
+};
+
+const geminiApiKeyStrategy: GoogleStrategy = {
+  name: "gemini-api-key",
+  auth: "apiKey",
+  headers: {
+    "User-Agent": "google-genai-sdk/ampcode-connector",
+    "X-Goog-Api-Client": "ampcode-connector",
+  },
+  endpoints: ["https://generativelanguage.googleapis.com"],
   wrapOpts: {
     userAgent: "pi-coding-agent",
     requestIdPrefix: "pi",
@@ -54,6 +71,7 @@ const antigravityModelMap: Record<string, string> = {
 
 const antigravityStrategy: GoogleStrategy = {
   name: "antigravity",
+  auth: "oauth",
   headers: {
     "User-Agent": "antigravity/1.104.0 darwin/arm64",
     "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
@@ -68,7 +86,7 @@ const antigravityStrategy: GoogleStrategy = {
   },
 };
 
-const strategies: readonly GoogleStrategy[] = [geminiStrategy, antigravityStrategy];
+const oauthStrategies: readonly GoogleStrategy[] = [geminiStrategy, antigravityStrategy];
 
 /** Models that only work on the antigravity strategy. */
 const ANTIGRAVITY_ONLY_MODELS = new Set(["gemini-3-pro-image-preview", "gemini-3.1-flash-image-preview"]);
@@ -89,7 +107,7 @@ function cooldownKey(account: number, strategy: GoogleStrategy): string {
   return `${account}:${strategy.name}`;
 }
 
-function getOrderedStrategies(account: number, model?: string): GoogleStrategy[] {
+function getOrderedStrategies(account: number, apiKey?: string, model?: string): GoogleStrategy[] {
   const now = Date.now();
 
   // Some models only work on antigravity — skip other strategies entirely
@@ -100,6 +118,7 @@ function getOrderedStrategies(account: number, model?: string): GoogleStrategy[]
   }
 
   const pref = preferredStrategy.get(account);
+  const strategies = apiKey ? [geminiStrategy, geminiApiKeyStrategy] : oauthStrategies;
   const ordered =
     pref && pref.until > now ? [pref.strategy, ...strategies.filter((s) => s !== pref.strategy)] : [...strategies];
 
@@ -194,18 +213,35 @@ function generateProjectId(): string {
   return `${adj}-${noun}-${rand}`;
 }
 
+export function buildGeminiApiKeyUrl(
+  endpoint: string,
+  model: string,
+  action: string,
+  stream: boolean,
+  apiKey?: string,
+): string {
+  const params = new URLSearchParams({ key: apiKey ?? "" });
+  if (stream || action === "streamGenerateContent") params.set("alt", "sse");
+  return `${endpoint}/v1beta/models/${encodeURIComponent(model)}:${action}?${params.toString()}`;
+}
+
 export const provider: Provider = {
   name: "Google",
   routeDecision: "LOCAL_GOOGLE",
 
-  isAvailable: (account?: number) =>
-    account !== undefined ? !!store.get("google", account)?.refreshToken : oauth.ready(config),
+  isAvailable: (account?: number, proxyConfig?: ProxyConfig) =>
+    account !== undefined
+      ? !!store.get("google", account)?.refreshToken || (account === 0 && !!proxyConfig?.geminiApiKey)
+      : oauth.ready(oauthConfig) || !!proxyConfig?.geminiApiKey,
 
-  accountCount: () => oauth.accountCount(config),
+  accountCount: (proxyConfig?: ProxyConfig) =>
+    Math.max(oauth.accountCount(oauthConfig), proxyConfig?.geminiApiKey ? 1 : 0),
 
-  async forward(sub, body, _originalHeaders, rewrite, account = 0) {
-    const accessToken = await oauth.token(config, account);
-    if (!accessToken) return denied("Google");
+  async forward(sub, body, _originalHeaders, rewrite, account = 0, proxyConfig?: ProxyConfig, signal?: AbortSignal) {
+    const apiKey = proxyConfig?.geminiApiKey;
+    const hasOauth = !!store.get("google", account)?.refreshToken;
+    const accessToken = hasOauth ? await oauth.token(oauthConfig, account) : null;
+    if (!accessToken && !apiKey) return denied("Google");
 
     const creds = store.get("google", account);
     const projectId = creds?.projectId || generateProjectId();
@@ -218,12 +254,12 @@ export const provider: Provider = {
     }
 
     const unwrapThenRewrite = withUnwrap(rewrite);
-    const orderedStrategies = getOrderedStrategies(account, modelAction.model);
+    const orderedStrategies = getOrderedStrategies(account, apiKey, modelAction.model);
 
     if (orderedStrategies.length === 0) {
       const now = Date.now();
       let minWait = COOLDOWN_MS;
-      for (const s of strategies) {
+      for (const s of apiKey ? [geminiStrategy, geminiApiKeyStrategy] : oauthStrategies) {
         const until = cooldowns.get(cooldownKey(account, s));
         if (until) minWait = Math.min(minWait, Math.max(0, until - now));
       }
@@ -243,14 +279,20 @@ export const provider: Provider = {
       const model = strategy.modelMapper ? strategy.modelMapper(modelAction.model) : modelAction.model;
       const isImageModel = model.includes("image");
       const wrapOpts = isImageModel ? { ...strategy.wrapOpts, requestType: "image_gen" as const } : strategy.wrapOpts;
-      const requestBody = maybeWrap(body.parsed, body.forwardBody, projectId, model, wrapOpts);
+      const requestBody =
+        strategy.auth === "apiKey"
+          ? body.forwardBody
+          : maybeWrap(body.parsed, body.forwardBody, projectId, model, wrapOpts);
 
       const headers: Record<string, string> = {
         ...strategy.headers,
-        Authorization: `Bearer ${accessToken}`,
         "Content-Type": "application/json",
         Accept: body.stream ? "text/event-stream" : "application/json",
       };
+      if (strategy.auth === "oauth") {
+        if (!accessToken) continue;
+        headers.Authorization = `Bearer ${accessToken}`;
+      }
 
       logger.info(`Google strategy=${strategy.name} account=${account} model=${model}`);
 
@@ -259,7 +301,10 @@ export const provider: Provider = {
       const action = forceStream ? "streamGenerateContent" : modelAction.action;
 
       for (const endpoint of strategy.endpoints) {
-        const url = buildUrl(endpoint, action);
+        const url =
+          strategy.auth === "apiKey"
+            ? buildGeminiApiKeyUrl(endpoint, model, action, body.stream, apiKey)
+            : buildUrl(endpoint, action);
         try {
           const forceStreamNonStreaming = forceStream && !body.stream;
           const response = await forward({
@@ -270,6 +315,7 @@ export const provider: Provider = {
             providerName: `Google/${strategy.name}`,
             rewrite: unwrapThenRewrite,
             email,
+            signal,
           });
 
           // When we forced streaming but client expects JSON, buffer SSE and return last chunk

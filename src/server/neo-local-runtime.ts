@@ -2,18 +2,18 @@ import type { ProxyConfig } from "../config/config.ts";
 import { logger } from "../utils/logger.ts";
 import { NeoCloudSync } from "./neo-cloud-sync.ts";
 import { LocalThreadActor, type SocketData } from "./neo-local-actor.ts";
-import { NeoLocalPersistence, type LocalActorSnapshot } from "./neo-local-persistence.ts";
+import { type LocalActorSnapshot, NeoLocalPersistence } from "./neo-local-persistence.ts";
 import {
+  type ActorRecord,
   actorRecord,
   contentTypeJson,
   extractActorIdFromProtocols,
   extractThreadIdFromActorBody,
+  type JsonRecord,
   jsonRecord,
   newActorId,
   parseProtocols,
   readJsonRecord,
-  type ActorRecord,
-  type JsonRecord,
 } from "./neo-protocol.ts";
 
 const DEFAULT_PORT = 6420;
@@ -50,7 +50,9 @@ export function startNeoLocalRuntime(config: ProxyConfig, hostname: string): Ret
           const actorId = extractActorIdFromProtocols(protocols) ?? url.searchParams.get("actorId");
           if (!actorId || !store.get(actorId)) return new Response("Unknown local Neo actor", { status: 404 });
           const headers = protocols[0] ? { "Sec-WebSocket-Protocol": protocols[0] } : undefined;
-          return srv.upgrade(req, { data: { actorId }, headers }) ? undefined : new Response("Upgrade failed", { status: 400 });
+          return srv.upgrade(req, { data: { actorId }, headers })
+            ? undefined
+            : new Response("Upgrade failed", { status: 400 });
         }
         return store.handleHttp(req, url);
       },
@@ -89,7 +91,13 @@ class ActorStore {
     this.cloudSync = new NeoCloudSync(config);
     for (const persisted of this.persistence.loadActors()) {
       const actor = this.createActor(persisted.id, persisted.name, persisted.key, persisted.record, persisted.snapshot);
-      this.actors.set(persisted.id, { id: persisted.id, name: persisted.name, key: persisted.key, record: persisted.record, actor });
+      this.actors.set(persisted.id, {
+        id: persisted.id,
+        name: persisted.name,
+        key: persisted.key,
+        record: persisted.record,
+        actor,
+      });
       if (persisted.key) this.byNameKey.set(this.nameKey(persisted.name, persisted.key), persisted.id);
     }
     if (this.actors.size > 0) logger.info(`Loaded ${this.actors.size} local Neo thread actor(s) from disk`);
@@ -111,7 +119,8 @@ class ActorStore {
     }
 
     const actorExport = url.pathname.match(/^\/actors\/([^/]+)\/(export|transcript\.md)$/);
-    if (actorExport && req.method === "GET") return this.exportActor(decodeURIComponent(actorExport[1]!), actorExport[2]!);
+    if (actorExport && req.method === "GET")
+      return this.exportActor(decodeURIComponent(actorExport[1]!), actorExport[2]!);
 
     if (url.pathname.startsWith("/actors/") && req.method === "DELETE") {
       const actorId = decodeURIComponent(url.pathname.slice("/actors/".length));
@@ -126,7 +135,9 @@ class ActorStore {
     const thread = jsonRecord(body.thread);
     const threadId = typeof thread.id === "string" ? thread.id : null;
     const actorId = url.searchParams.get("actorId") ?? req.headers.get("x-rivet-actor") ?? undefined;
-    const stored = (actorId ? this.actors.get(actorId) : undefined) ?? [...this.actors.values()].find((actor) => actor.actor.snapshot().threadId === threadId || actor.key === threadId);
+    const stored =
+      (actorId ? this.actors.get(actorId) : undefined) ??
+      [...this.actors.values()].find((actor) => actor.actor.snapshot().threadId === threadId || actor.key === threadId);
     if (!stored) return Response.json({ error: "actor_not_found" }, { status: 404 });
     stored.actor.importCloudThread(thread);
     this.save(stored.id, stored.name, stored.key, stored.record, stored.actor.snapshot());
@@ -135,7 +146,8 @@ class ActorStore {
 
   private findActors(url: URL): ActorRecord[] {
     const actorIds = url.searchParams.get("actor_ids");
-    if (actorIds) return actorIds.split(",").flatMap((id) => (this.actors.get(id)?.record ? [this.actors.get(id)!.record] : []));
+    if (actorIds)
+      return actorIds.split(",").flatMap((id) => (this.actors.get(id)?.record ? [this.actors.get(id)!.record] : []));
 
     const name = url.searchParams.get("name");
     const key = url.searchParams.get("key");
@@ -169,7 +181,15 @@ class ActorStore {
     return { ...stored, created: true };
   }
 
-  private createActor(id: string, name: string, key: string | null, record: ActorRecord, snapshot?: LocalActorSnapshot, threadId?: string, input?: JsonRecord): LocalThreadActor {
+  private createActor(
+    id: string,
+    name: string,
+    key: string | null,
+    record: ActorRecord,
+    snapshot?: LocalActorSnapshot,
+    threadId?: string,
+    input?: JsonRecord,
+  ): LocalThreadActor {
     return new LocalThreadActor({
       config: this.config,
       actorId: id,

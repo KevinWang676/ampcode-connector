@@ -96,7 +96,9 @@ async function handle(req: Request, url: URL, config: ProxyConfig): Promise<Resp
 async function forwardThreadSync(req: Request, config: ProxyConfig): Promise<Response> {
   const response = await upstream.forward(req, config.ampUpstreamUrl, config.ampApiKey);
   void importThreadSyncResponse(response.clone()).catch((err) => {
-    logger.warn("Failed to import Amp thread sync response into local Neo store", { error: err instanceof Error ? err.message : String(err) });
+    logger.warn("Failed to import Amp thread sync response into local Neo store", {
+      error: err instanceof Error ? err.message : String(err),
+    });
   });
   return response;
 }
@@ -165,7 +167,11 @@ async function handleLocalThreadApi(req: Request, url: URL): Promise<Response | 
   if (pathname === "/api/threads/find") {
     const limit = Number(searchParams.get("limit") ?? 20);
     const offset = Number(searchParams.get("offset") ?? 0);
-    const threads = store.findThreads(searchParams.get("q") ?? "", Number.isFinite(limit) ? limit : 20, Number.isFinite(offset) ? offset : 0);
+    const threads = store.findThreads(
+      searchParams.get("q") ?? "",
+      Number.isFinite(limit) ? limit : 20,
+      Number.isFinite(offset) ? offset : 0,
+    );
     if (threads.length > 0 || searchParams.get("local") === "1") return Response.json({ threads });
     return null;
   }
@@ -215,7 +221,7 @@ async function handleProvider(
 
   if (route.handler) {
     const rewrite = ampModel ? rewriter.rewrite(ampModel) : undefined;
-    const handlerResponse = await route.handler.forward(sub, body, req.headers, rewrite, route.account);
+    const handlerResponse = await route.handler.forward(sub, body, req.headers, rewrite, route.account, config);
 
     if (
       (handlerResponse.status === 429 || handlerResponse.status === 403 || handlerResponse.status === 404) &&
