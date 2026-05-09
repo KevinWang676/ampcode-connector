@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { buildGeminiApiKeyUrl, provider as googleProvider } from "../src/providers/google.ts";
 import { parseBody } from "../src/server/body.ts";
 import { resolveModel, rewriteBodyModel } from "../src/utils/models.ts";
 import * as path from "../src/utils/path.ts";
@@ -24,6 +25,36 @@ describe("path.modelFromUrl", () => {
 
   test("extracts from nested model path", () => {
     expect(path.modelFromUrl("/api/v1beta/models/gemini-pro:generateContent")).toBe("gemini-pro");
+  });
+});
+
+describe("google Gemini API key support", () => {
+  test("makes Google provider available without OAuth when an API key is configured", () => {
+    const config = {
+      hostname: "localhost",
+      port: 8765,
+      ampUpstreamUrl: "https://ampcode.com",
+      geminiApiKey: "test-key",
+      logLevel: "error" as const,
+      providers: { anthropic: true, codex: true, google: true },
+    };
+
+    expect(googleProvider.isAvailable(0, config)).toBe(true);
+    expect(googleProvider.accountCount(config)).toBeGreaterThanOrEqual(1);
+  });
+
+  test("builds direct Gemini API key URLs with SSE when streaming", () => {
+    expect(
+      buildGeminiApiKeyUrl(
+        "https://generativelanguage.googleapis.com",
+        "gemini-3-flash-preview",
+        "streamGenerateContent",
+        true,
+        "test-key",
+      ),
+    ).toBe(
+      "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:streamGenerateContent?key=test-key&alt=sse",
+    );
   });
 });
 

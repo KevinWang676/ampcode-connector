@@ -1,10 +1,15 @@
 import type { ProxyConfig } from "../config/config.ts";
 import { logger } from "../utils/logger.ts";
 import { extractLocalThreadContent, generateLocalThreadTitle, inferLocal } from "./neo-local-inference.ts";
-import { NeoLocalPersistence, type LocalActorSnapshot } from "./neo-local-persistence.ts";
+import { type LocalActorSnapshot, NeoLocalPersistence } from "./neo-local-persistence.ts";
 import {
   decodeThreadMessage,
+  type JsonRecord,
   jsonRecord,
+  type LocalHistoryMessage,
+  type NeoThreadMessage,
+  type NeoToolSpec,
+  type NeoToolUseBlock,
   newMessageId,
   normalizeNeoUsage,
   normalizeToolCallId,
@@ -13,14 +18,17 @@ import {
   sendProtocol,
   textFromBlocks,
   toolResultMessageId,
-  type JsonRecord,
-  type LocalHistoryMessage,
-  type NeoThreadMessage,
-  type NeoToolSpec,
-  type NeoToolUseBlock,
 } from "./neo-protocol.ts";
-export interface SocketData { actorId: string }
-interface PendingToolCall { id: string; name: string; input: JsonRecord; agentMode: string; reasoningEffort?: string }
+export interface SocketData {
+  actorId: string;
+}
+interface PendingToolCall {
+  id: string;
+  name: string;
+  input: JsonRecord;
+  agentMode: string;
+  reasoningEffort?: string;
+}
 const THREAD_ID_PATTERN = /T-[0-9A-Za-z][0-9A-Za-z-]*/;
 const READ_THREAD_MAX_CHARS = 80_000;
 const READ_THREAD_TOOL_RESULT_MAX_CHARS = 8_000;
@@ -48,17 +56,27 @@ function extractRequestedThreadId(value: unknown): string | null {
   return value.match(THREAD_ID_PATTERN)?.[0] ?? null;
 }
 
-export async function localReadThreadRun(input: JsonRecord, store = new NeoLocalPersistence(), config?: ProxyConfig, currentThreadId = "local-read-thread"): Promise<JsonRecord | null> {
+export async function localReadThreadRun(
+  input: JsonRecord,
+  store = new NeoLocalPersistence(),
+  config?: ProxyConfig,
+  currentThreadId = "local-read-thread",
+): Promise<JsonRecord | null> {
   const requestedThreadId = extractRequestedThreadId(input.threadID);
   if (!requestedThreadId) return null;
   const actor = store.jsonForThread(requestedThreadId);
   const result = actor ? compactThreadMarkdown(actor, requestedThreadId) : store.markdownForThread(requestedThreadId);
   if (!result) return null;
   const goal = typeof input.goal === "string" ? input.goal : "Extract the relevant information from this thread.";
-  const extracted = config ? await extractLocalThreadContent(config, currentThreadId, requestedThreadId, result, goal).catch((err) => {
-    logger.warn("Local read_thread extraction failed; returning compact transcript", { threadID: requestedThreadId, error: err instanceof Error ? err.message : String(err) });
-    return null;
-  }) : null;
+  const extracted = config
+    ? await extractLocalThreadContent(config, currentThreadId, requestedThreadId, result, goal).catch((err) => {
+        logger.warn("Local read_thread extraction failed; returning compact transcript", {
+          threadID: requestedThreadId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return null;
+      })
+    : null;
   return {
     status: "done",
     result: extracted ?? result,
@@ -79,7 +97,11 @@ function compactThreadMarkdown(actor: JsonRecord, threadId: string): string {
     if (!text) continue;
     lines.push(`## ${role}${messageId}`, "", text, "");
   }
-  return clipText(lines.join("\n").trim(), READ_THREAD_MAX_CHARS, "\n\n[Thread transcript compacted for context window]");
+  return clipText(
+    lines.join("\n").trim(),
+    READ_THREAD_MAX_CHARS,
+    "\n\n[Thread transcript compacted for context window]",
+  );
 }
 
 function compactBlocks(blocks: unknown): string {
@@ -93,9 +115,12 @@ function compactBlock(block: unknown): string {
   const item = jsonRecord(block);
   if (item.type === "thinking") return "";
   if (item.type === "text" && typeof item.text === "string") return item.text;
-  if (item.type === "tool_use") return `Tool call: ${String(item.name ?? "unknown")}\n\`\`\`json\n${clipText(JSON.stringify(item.input ?? {}, null, 2), READ_THREAD_JSON_BLOCK_MAX_CHARS)}\n\`\`\``;
-  if (item.type === "tool_result") return `Tool result (${String(item.toolUseID ?? "unknown")}):\n\`\`\`\n${clipText(cleanToolResultText(runToText(item.run)), READ_THREAD_TOOL_RESULT_MAX_CHARS)}\n\`\`\``;
-  if (item.type === "manual_bash_invocation") return `Manual bash invocation: ${clipText(JSON.stringify(item.args ?? {}), READ_THREAD_JSON_BLOCK_MAX_CHARS)}`;
+  if (item.type === "tool_use")
+    return `Tool call: ${String(item.name ?? "unknown")}\n\`\`\`json\n${clipText(JSON.stringify(item.input ?? {}, null, 2), READ_THREAD_JSON_BLOCK_MAX_CHARS)}\n\`\`\``;
+  if (item.type === "tool_result")
+    return `Tool result (${String(item.toolUseID ?? "unknown")}):\n\`\`\`\n${clipText(cleanToolResultText(runToText(item.run)), READ_THREAD_TOOL_RESULT_MAX_CHARS)}\n\`\`\``;
+  if (item.type === "manual_bash_invocation")
+    return `Manual bash invocation: ${clipText(JSON.stringify(item.args ?? {}), READ_THREAD_JSON_BLOCK_MAX_CHARS)}`;
   return clipText(JSON.stringify(stripHugeFields(item), null, 2), READ_THREAD_JSON_BLOCK_MAX_CHARS);
 }
 
@@ -158,6 +183,7 @@ export class LocalThreadActor {
   private currentReasoningEffort: string | undefined;
   private activeAssistantMessageId: string | undefined;
   private titleGenerationStarted = false;
+  private inferenceAbort: AbortController | null = null;
   constructor(private readonly options: LocalThreadActorOptions) {
     const snapshot = options.snapshot;
     if (snapshot) {
@@ -181,7 +207,10 @@ export class LocalThreadActor {
   }
   importCloudThread(thread: JsonRecord): void {
     const messages = Array.isArray(thread.messages) ? thread.messages : [];
-    this.settings = { ...this.settings, ...(typeof thread.agentMode === "string" ? { agentMode: thread.agentMode } : {}) };
+    this.settings = {
+      ...this.settings,
+      ...(typeof thread.agentMode === "string" ? { agentMode: thread.agentMode } : {}),
+    };
     this.title = typeof thread.title === "string" ? thread.title : this.title;
     this.cloud = { ...this.cloud, meta: jsonRecord(thread.meta) };
     this.messages = messages.map((raw, index) => {
@@ -190,13 +219,23 @@ export class LocalThreadActor {
       return {
         threadId: this.options.threadId,
         role,
-        messageId: typeof msg.messageId === "string" ? msg.messageId : typeof msg.protocolMessageID === "string" ? msg.protocolMessageID : newMessageId(),
+        messageId:
+          typeof msg.messageId === "string"
+            ? msg.messageId
+            : typeof msg.protocolMessageID === "string"
+              ? msg.protocolMessageID
+              : newMessageId(),
         content: Array.isArray(msg.content) ? msg.content : [],
         agentMode: typeof msg.agentMode === "string" ? msg.agentMode : undefined,
         reasoningEffort: typeof msg.reasoningEffort === "string" ? msg.reasoningEffort : undefined,
         meta: jsonRecord(msg.meta),
         userState: msg.userState,
-        state: role === "assistant" ? (jsonRecord(msg.state).type ? (jsonRecord(msg.state) as NeoThreadMessage["state"]) : { type: "complete", stopReason: "end_turn" }) : undefined,
+        state:
+          role === "assistant"
+            ? jsonRecord(msg.state).type
+              ? (jsonRecord(msg.state) as NeoThreadMessage["state"])
+              : { type: "complete", stopReason: "end_turn" }
+            : undefined,
         usage: jsonRecord(msg.usage),
         seq: index + 1,
       };
@@ -247,40 +286,73 @@ export class LocalThreadActor {
   }
   private async handle(ws: Bun.ServerWebSocket<SocketData>, msg: JsonRecord): Promise<void> {
     switch (msg.type) {
-      case "client_resume": return this.sendSnapshot(ws, typeof msg.version === "number" ? msg.version : 0);
-      case "client_update_thread_settings": return this.updateSettings(jsonRecord(msg.settings));
-      case "executor_connect": return this.executorConnect(msg);
+      case "client_resume":
+        return this.sendSnapshot(ws, typeof msg.version === "number" ? msg.version : 0);
+      case "client_update_thread_settings":
+        return this.updateSettings(jsonRecord(msg.settings));
+      case "executor_connect":
+        return this.executorConnect(msg);
       case "executor_environment_snapshot":
-      case "executor_environment_update": return this.updateEnvironment(jsonRecord(msg.environment));
-      case "executor_tools_register": return this.registerTools(msg.tools);
-      case "executor_tools_unregister": return this.unregisterTools(msg.toolNames);
-      case "executor_tools_bootstrap_complete": return this.completeExecutorBootstrap(msg);
-      case "executor_tool_lease_ack": return;
-      case "client_append_user_msg": return this.receiveUserMessage(msg);
-      case "executor_tool_result": return this.receiveToolResult(msg);
-      case "tool_progress": return this.broadcast(msg);
-      case "executor_tool_approval_request": return this.receiveApprovalRequest(jsonRecord(msg.approval));
-      case "client_tool_approval_response": return this.resolveApproval(msg);
-      case "client_filesystem_read_directory": return this.broadcast({ type: "executor_filesystem_read_directory", requestId: msg.requestId, uri: msg.uri });
-      case "client_filesystem_read_file": return this.broadcast({ type: "executor_filesystem_read_file", requestId: msg.requestId, uri: msg.uri });
-      case "executor_filesystem_read_directory_result": return this.broadcast({ ...msg, type: "client_filesystem_read_directory_result" });
-      case "executor_filesystem_read_file_result": return this.broadcast({ ...msg, type: "client_filesystem_read_file_result" });
-      case "executor_plugin_message": return this.broadcast({ type: "plugin_message", message: msg.message });
-      case "executor_artifact_upsert": return this.broadcast({ type: "artifact_upserted", artifact: msg.artifact });
-      case "executor_artifact_delete": return this.broadcast({ type: "artifact_deleted", key: msg.key });
-      case "client_cancel": return this.cancel();
-      case "client_remove_queued_msg": return this.removeQueuedMessage(String(msg.queuedMessageId ?? ""));
-      case "client_steer_queued_msg": return this.steerQueuedMessage(String(msg.queuedMessageId ?? ""));
-      case "client_edit_message": return this.editMessage(msg);
-      case "client_mark_message_read": return this.markRead(String(msg.messageId ?? ""), true);
-      case "client_mark_message_unread": return this.markRead(String(msg.messageId ?? ""), false);
-      case "client_set_thread_title": return this.setTitle(typeof msg.title === "string" ? msg.title : null);
-      case "client_retry": return this.retry();
-      case "client_dismiss_active_error": return this.broadcast({ type: "error_cleared", seq: typeof msg.seq === "number" ? msg.seq : this.nextSeq() });
-      case "client_append_manual_bash_invocation": return this.appendManualBashInvocation(msg);
-      case "client_spawn_executor": return this.rejectExecutorSpawn(msg);
-      case "client_upsert_notification_subscription": return;
-      default: logger.debug(`Neo local runtime ignored message ${msg.type}`);
+      case "executor_environment_update":
+        return this.updateEnvironment(jsonRecord(msg.environment));
+      case "executor_tools_register":
+        return this.registerTools(msg.tools);
+      case "executor_tools_unregister":
+        return this.unregisterTools(msg.toolNames);
+      case "executor_tools_bootstrap_complete":
+        return this.completeExecutorBootstrap(msg);
+      case "executor_tool_lease_ack":
+        return;
+      case "client_append_user_msg":
+        return this.receiveUserMessage(msg);
+      case "executor_tool_result":
+        return this.receiveToolResult(msg);
+      case "tool_progress":
+        return this.broadcast(msg);
+      case "executor_tool_approval_request":
+        return this.receiveApprovalRequest(jsonRecord(msg.approval));
+      case "client_tool_approval_response":
+        return this.resolveApproval(msg);
+      case "client_filesystem_read_directory":
+        return this.broadcast({ type: "executor_filesystem_read_directory", requestId: msg.requestId, uri: msg.uri });
+      case "client_filesystem_read_file":
+        return this.broadcast({ type: "executor_filesystem_read_file", requestId: msg.requestId, uri: msg.uri });
+      case "executor_filesystem_read_directory_result":
+        return this.broadcast({ ...msg, type: "client_filesystem_read_directory_result" });
+      case "executor_filesystem_read_file_result":
+        return this.broadcast({ ...msg, type: "client_filesystem_read_file_result" });
+      case "executor_plugin_message":
+        return this.broadcast({ type: "plugin_message", message: msg.message });
+      case "executor_artifact_upsert":
+        return this.broadcast({ type: "artifact_upserted", artifact: msg.artifact });
+      case "executor_artifact_delete":
+        return this.broadcast({ type: "artifact_deleted", key: msg.key });
+      case "client_cancel":
+        return this.cancel();
+      case "client_remove_queued_msg":
+        return this.removeQueuedMessage(String(msg.queuedMessageId ?? ""));
+      case "client_steer_queued_msg":
+        return this.steerQueuedMessage(String(msg.queuedMessageId ?? ""));
+      case "client_edit_message":
+        return this.editMessage(msg);
+      case "client_mark_message_read":
+        return this.markRead(String(msg.messageId ?? ""), true);
+      case "client_mark_message_unread":
+        return this.markRead(String(msg.messageId ?? ""), false);
+      case "client_set_thread_title":
+        return this.setTitle(typeof msg.title === "string" ? msg.title : null);
+      case "client_retry":
+        return this.retry();
+      case "client_dismiss_active_error":
+        return this.broadcast({ type: "error_cleared", seq: typeof msg.seq === "number" ? msg.seq : this.nextSeq() });
+      case "client_append_manual_bash_invocation":
+        return this.appendManualBashInvocation(msg);
+      case "client_spawn_executor":
+        return this.rejectExecutorSpawn(msg);
+      case "client_upsert_notification_subscription":
+        return;
+      default:
+        logger.debug(`Neo local runtime ignored message ${msg.type}`);
     }
   }
   private updateSettings(settings: JsonRecord): void {
@@ -303,7 +375,10 @@ export class LocalThreadActor {
     this.persist();
   }
   private completeExecutorBootstrap(msg: JsonRecord): void {
-    if (msg.ok === false) return this.fail(new Error(typeof msg.error === "string" ? msg.error : "Executor bootstrap failed"));
+    if (msg.ok === false) {
+      this.fail(new Error(typeof msg.error === "string" ? msg.error : "Executor bootstrap failed"));
+      return;
+    }
     this.executorReady = true;
     this.sendExecutorConnected();
     this.processQueue();
@@ -323,7 +398,11 @@ export class LocalThreadActor {
 
     if (this.agentState !== "idle" || !this.executorReady) {
       this.queue.push(user);
-      this.broadcast({ type: "queued_message_added", message: { steer: Boolean(msg.steer), queuedMessage: user }, seq: this.nextSeq() });
+      this.broadcast({
+        type: "queued_message_added",
+        message: { steer: Boolean(msg.steer), queuedMessage: user },
+        seq: this.nextSeq(),
+      });
       this.persist();
       return;
     }
@@ -352,12 +431,20 @@ export class LocalThreadActor {
   }
 
   private maybeGenerateTitle(content: unknown[]): void {
-    if (this.title || this.titleGenerationStarted || this.messages.some((message) => message.role === "user") === false) return;
+    if (this.title || this.titleGenerationStarted || this.messages.some((message) => message.role === "user") === false)
+      return;
     const text = textFromBlocks(content);
     this.titleGenerationStarted = true;
     generateLocalThreadTitle(this.options.config, this.options.threadId, text)
-      .then(({ title }) => { if (title && !this.title) this.setTitle(title); })
-      .catch((err) => logger.warn("Neo local title generation failed", { threadID: this.options.threadId, error: err instanceof Error ? err.message : String(err) }));
+      .then(({ title }) => {
+        if (title && !this.title) this.setTitle(title);
+      })
+      .catch((err) =>
+        logger.warn("Neo local title generation failed", {
+          threadID: this.options.threadId,
+          error: err instanceof Error ? err.message : String(err),
+        }),
+      );
   }
 
   private async runInference(agentMode: string, reasoningEffort?: string): Promise<void> {
@@ -369,23 +456,97 @@ export class LocalThreadActor {
     this.setAgentState("working", assistantId, agentMode, reasoningEffort);
     this.broadcast({ type: "inference_tools", messageId: assistantId, agentMode, tools: [...this.tools.keys()] });
 
+    if (this.inferenceAbort) this.inferenceAbort.abort();
+    const abortController = new AbortController();
+    this.inferenceAbort = abortController;
+
+    let streamingStarted = false;
+    let lastUsage: JsonRecord | undefined;
+
+    const ensureStreamingState = (): void => {
+      if (streamingStarted) return;
+      streamingStarted = true;
+      this.setAgentState("streaming", assistantId, agentMode, reasoningEffort);
+    };
+
     try {
-      const result = await inferLocal(this.options.config, {
-        actorId: this.options.actorId,
-        threadId: this.options.threadId,
-        agentMode,
-        reasoningEffort,
-        settings: this.settings,
-        history: this.history,
-        tools: [...this.tools.values()].filter((tool) => !tool.meta?.deferred),
-        environment: this.environment,
-      });
+      const result = await inferLocal(
+        this.options.config,
+        {
+          actorId: this.options.actorId,
+          threadId: this.options.threadId,
+          agentMode,
+          reasoningEffort,
+          settings: this.settings,
+          history: this.history,
+          tools: [...this.tools.values()].filter((tool) => !tool.meta?.deferred),
+          environment: this.environment,
+          signal: abortController.signal,
+        },
+        {
+          // Send each text chunk as an INCREMENTAL delta. Neo `delta.blocks` is
+          // append/patch by blockIndex (mirrors Anthropic Messages SSE), not a
+          // snapshot — so we must emit just the new bytes, not the full
+          // accumulated text. Sending snapshots was O(N²) over the run length
+          // and caused the visible mid-stream slowdown.
+          onTextDelta: (chunk) => {
+            if (generation !== this.generation) return;
+            if (!chunk) return;
+            ensureStreamingState();
+            this.broadcast({
+              type: "delta",
+              messageId: assistantId,
+              role: "assistant",
+              blocks: [{ type: "text", text: chunk }],
+              blockIndex: 0,
+              state: "generating",
+            });
+          },
+          onThinkingDelta: () => {
+            if (generation !== this.generation) return;
+            ensureStreamingState();
+          },
+          onToolStart: (call) => {
+            if (generation !== this.generation) return;
+            ensureStreamingState();
+            // Tool blocks land in finishAssistantMessage with their final
+            // input. Streaming partial tool stubs through delta would race
+            // the final complete tool_use block in the CLI's view.
+            void call;
+          },
+          onToolInputDelta: () => {
+            if (generation !== this.generation) return;
+            ensureStreamingState();
+          },
+          onUsage: (usage) => {
+            lastUsage = usage;
+          },
+        },
+      );
+
       if (generation !== this.generation) return;
+      if (this.inferenceAbort === abortController) this.inferenceAbort = null;
       const toolCalls = result.toolCalls.map((call) => ({ ...call, id: normalizeToolCallId(call.id) }));
       logger.info(`Neo local inference complete text=${result.text.length} toolCalls=${toolCalls.length}`);
-      await this.finishAssistantMessage(assistantId, result.text, toolCalls, result.usage, agentMode, reasoningEffort);
+      await this.finishAssistantMessage(
+        assistantId,
+        result.text,
+        toolCalls,
+        result.usage ?? lastUsage,
+        agentMode,
+        reasoningEffort,
+        streamingStarted,
+      );
     } catch (err) {
+      if (this.inferenceAbort === abortController) this.inferenceAbort = null;
       if (generation !== this.generation) return;
+      // Suppress AbortError noise when caller cancelled mid-flight
+      if (abortController.signal.aborted) {
+        this.activeAssistantMessageId = undefined;
+        this.setAgentState("idle", assistantId, agentMode, reasoningEffort);
+        this.processQueue();
+        return;
+      }
       this.fail(err);
       this.activeAssistantMessageId = undefined;
       this.setAgentState("idle", assistantId, agentMode, reasoningEffort);
@@ -393,17 +554,63 @@ export class LocalThreadActor {
     }
   }
 
-  private async finishAssistantMessage(messageId: string, text: string, toolCalls: Array<Omit<PendingToolCall, "agentMode">>, usage: JsonRecord | undefined, agentMode: string, reasoningEffort?: string): Promise<void> {
+  private async finishAssistantMessage(
+    messageId: string,
+    text: string,
+    toolCalls: Array<Omit<PendingToolCall, "agentMode">>,
+    usage: JsonRecord | undefined,
+    agentMode: string,
+    reasoningEffort?: string,
+    alreadyStreamedText = false,
+  ): Promise<void> {
     const blocks: Array<NeoToolUseBlock | { type: "text"; text: string }> = [];
     if (text) blocks.push({ type: "text", text });
-    for (const call of toolCalls) blocks.push({ type: "tool_use", id: call.id, name: call.name, input: call.input, complete: true });
+    for (const call of toolCalls)
+      blocks.push({ type: "tool_use", id: call.id, name: call.name, input: call.input, complete: true });
 
     const neoUsage = normalizeNeoUsage(usage);
     this.setAgentState("streaming", messageId, agentMode, reasoningEffort);
-    this.broadcast({ type: "delta", messageId, role: "assistant", blocks, blockIndex: 0, state: toolCalls.length ? "tool_use" : "generating", usage: neoUsage });
-    if (toolCalls.length === 0) this.broadcast({ type: "delta", messageId, role: "assistant", blocks: [], state: "complete", usage: neoUsage });
 
-    const stored = this.storeMessage({ threadId: this.options.threadId, messageId, role: "assistant", content: blocks, state: { type: "complete", stopReason: toolCalls.length ? "tool_use" : "end_turn" }, usage: neoUsage, createdAt: nowIso() });
+    // When we streamed token-level text deltas, do NOT replay the full
+    // accumulated text here — the CLI has already appended each chunk via
+    // delta.blocks[0].text. Replaying would duplicate the response. Only
+    // append tool_use blocks (which we don't stream incrementally) and the
+    // terminal usage frame.
+    if (!alreadyStreamedText) {
+      this.broadcast({
+        type: "delta",
+        messageId,
+        role: "assistant",
+        blocks,
+        blockIndex: 0,
+        state: toolCalls.length ? "tool_use" : "generating",
+        usage: neoUsage,
+      });
+    } else if (toolCalls.length > 0) {
+      // After streaming text, append the tool_use blocks at index 1+.
+      const toolBlocks = blocks.filter((block) => block.type === "tool_use");
+      this.broadcast({
+        type: "delta",
+        messageId,
+        role: "assistant",
+        blocks: toolBlocks,
+        blockIndex: text ? 1 : 0,
+        state: "tool_use",
+        usage: neoUsage,
+      });
+    }
+    if (toolCalls.length === 0)
+      this.broadcast({ type: "delta", messageId, role: "assistant", blocks: [], state: "complete", usage: neoUsage });
+
+    const stored = this.storeMessage({
+      threadId: this.options.threadId,
+      messageId,
+      role: "assistant",
+      content: blocks,
+      state: { type: "complete", stopReason: toolCalls.length ? "tool_use" : "end_turn" },
+      usage: neoUsage,
+      createdAt: nowIso(),
+    });
     this.broadcast({ type: "message_added", message: this.protocolMessage(stored), seq: stored.seq });
     this.history.push({ role: "assistant", text, toolCalls });
     this.persist();
@@ -422,7 +629,13 @@ export class LocalThreadActor {
       if (localRun) {
         this.receiveToolRun(call.id, localRun, false);
       } else {
-        this.broadcast({ type: "tool_lease", toolCallId: call.id, toolName: call.name, args: call.input, messageId: stored.messageId });
+        this.broadcast({
+          type: "tool_lease",
+          toolCallId: call.id,
+          toolName: call.name,
+          args: call.input,
+          messageId: stored.messageId,
+        });
       }
     }
   }
@@ -433,12 +646,31 @@ export class LocalThreadActor {
 
   private receiveToolRun(toolCallId: string, run: JsonRecord, ackExecutor: boolean): void {
     const pending = this.pendingTools.get(toolCallId);
-    if (!pending) return this.broadcast({ type: "executor_error", message: `Unknown tool lease ${toolCallId}`, toolCallId, code: "LEASE_NOT_FOUND" });
+    if (!pending) {
+      this.broadcast({
+        type: "executor_error",
+        message: `Unknown tool lease ${toolCallId}`,
+        toolCallId,
+        code: "LEASE_NOT_FOUND",
+      });
+      return;
+    }
 
     this.pendingTools.delete(toolCallId);
-    const message = this.storeMessage({ threadId: this.options.threadId, role: "user", messageId: toolResultMessageId(toolCallId), content: [{ type: "tool_result", toolUseID: toolCallId, run }], createdAt: nowIso() });
+    const message = this.storeMessage({
+      threadId: this.options.threadId,
+      role: "user",
+      messageId: toolResultMessageId(toolCallId),
+      content: [{ type: "tool_result", toolUseID: toolCallId, run }],
+      createdAt: nowIso(),
+    });
     this.history.push({ role: "tool", toolCallId, toolName: pending.name, text: runToText(run) });
-    this.broadcast({ type: "message_added", message: this.protocolMessage(message), seq: message.seq, parentToolUseId: toolCallId });
+    this.broadcast({
+      type: "message_added",
+      message: this.protocolMessage(message),
+      seq: message.seq,
+      parentToolUseId: toolCallId,
+    });
     if (ackExecutor) this.broadcast({ type: "executor_tool_result_ack", toolCallId });
     this.persist();
 
@@ -449,7 +681,8 @@ export class LocalThreadActor {
   }
 
   private async localToolRun(call: Omit<PendingToolCall, "agentMode">): Promise<JsonRecord | null> {
-    if (call.name === "read_thread") return localReadThreadRun(call.input, new NeoLocalPersistence(), this.options.config, this.options.threadId);
+    if (call.name === "read_thread")
+      return localReadThreadRun(call.input, new NeoLocalPersistence(), this.options.config, this.options.threadId);
     if (call.name === "find_thread") return localFindThreadRun(call.input);
     return null;
   }
@@ -463,42 +696,98 @@ export class LocalThreadActor {
   private resolveApproval(msg: JsonRecord): void {
     const toolCallId = String(msg.toolCallId ?? "");
     for (const [id, approval] of this.approvals) if (approval.toolCallId === toolCallId) this.approvals.delete(id);
-    this.broadcast({ type: "executor_tool_approval_response", toolCallId, accepted: Boolean(msg.accepted), input: jsonRecord(msg.input) });
+    this.broadcast({
+      type: "executor_tool_approval_response",
+      toolCallId,
+      accepted: Boolean(msg.accepted),
+      input: jsonRecord(msg.input),
+    });
     this.broadcastApprovalQueue();
   }
 
   private editMessage(msg: JsonRecord): void {
     const index = this.messages.findIndex((message) => message.messageId === msg.messageId && message.role === "user");
-    if (index < 0) return this.broadcast({ type: "edit_rejected", editId: String(msg.editId ?? "unknown"), message: "Message not found" });
+    if (index < 0) {
+      this.broadcast({
+        type: "edit_rejected",
+        editId: String(msg.editId ?? "unknown"),
+        message: "Message not found",
+      });
+      return;
+    }
     const removed = this.messages[index + 1];
-    this.messages[index] = { ...this.messages[index]!, content: Array.isArray(msg.content) ? msg.content : [], agentMode: typeof msg.agentMode === "string" ? msg.agentMode : this.messages[index]!.agentMode };
+    this.messages[index] = {
+      ...this.messages[index]!,
+      content: Array.isArray(msg.content) ? msg.content : [],
+      agentMode: typeof msg.agentMode === "string" ? msg.agentMode : this.messages[index]!.agentMode,
+    };
     this.messages = this.messages.slice(0, index + 1);
     this.rebuildHistory();
-    this.broadcast({ type: "message_updated", message: this.protocolMessage(this.messages[index]!), seq: this.messages[index]!.seq });
-    if (removed) this.broadcast({ type: "thread_truncated", seq: this.nextSeq(), truncateFromMessage: removed.messageId });
+    this.broadcast({
+      type: "message_updated",
+      message: this.protocolMessage(this.messages[index]!),
+      seq: this.messages[index]!.seq,
+    });
+    if (removed)
+      this.broadcast({ type: "thread_truncated", seq: this.nextSeq(), truncateFromMessage: removed.messageId });
     this.persist();
     void this.runInference(typeof msg.agentMode === "string" ? msg.agentMode : this.agentMode());
   }
 
   private appendManualBashInvocation(msg: JsonRecord): void {
-    const message = this.storeMessage({ threadId: this.options.threadId, role: "info", messageId: newMessageId(), content: [{ type: "manual_bash_invocation", args: jsonRecord(msg.args), toolRun: jsonRecord(msg.run), hidden: Boolean(msg.hidden) }], createdAt: nowIso() });
+    const message = this.storeMessage({
+      threadId: this.options.threadId,
+      role: "info",
+      messageId: newMessageId(),
+      content: [
+        {
+          type: "manual_bash_invocation",
+          args: jsonRecord(msg.args),
+          toolRun: jsonRecord(msg.run),
+          hidden: Boolean(msg.hidden),
+        },
+      ],
+      createdAt: nowIso(),
+    });
     this.broadcast({ type: "message_added", message: this.protocolMessage(message), seq: message.seq });
     this.persist();
   }
 
   private sendSnapshot(ws: Bun.ServerWebSocket<SocketData>, sinceSeq: number): void {
     sendProtocol(ws, { type: "thread_settings", settings: this.settings });
-    sendProtocol(ws, { type: "queued_messages", messages: this.queue.map((queuedMessage) => ({ steer: false, queuedMessage })) });
-    sendProtocol(ws, { type: "observers", count: this.sockets.size, observers: [], hasExecutor: Boolean(this.executorId) });
+    sendProtocol(ws, {
+      type: "queued_messages",
+      messages: this.queue.map((queuedMessage) => ({ steer: false, queuedMessage })),
+    });
+    sendProtocol(ws, {
+      type: "observers",
+      count: this.sockets.size,
+      observers: [],
+      hasExecutor: Boolean(this.executorId),
+    });
     if (this.executorId) this.sendExecutorConnected(ws);
     if (this.title) sendProtocol(ws, { type: "thread_title", title: this.title });
-    if (Object.keys(this.environment).length > 0) sendProtocol(ws, { type: "environment_update", environment: this.environment });
-    for (const message of this.messages) if (message.seq > sinceSeq) sendProtocol(ws, { type: "message_added", message: this.protocolMessage(message), seq: message.seq });
-    sendProtocol(ws, { type: "agent_state", state: this.agentState, agentMode: this.currentAgentMode, reasoningEffort: this.currentReasoningEffort });
+    if (Object.keys(this.environment).length > 0)
+      sendProtocol(ws, { type: "environment_update", environment: this.environment });
+    for (const message of this.messages)
+      if (message.seq > sinceSeq)
+        sendProtocol(ws, { type: "message_added", message: this.protocolMessage(message), seq: message.seq });
+    sendProtocol(ws, {
+      type: "agent_state",
+      state: this.agentState,
+      agentMode: this.currentAgentMode,
+      reasoningEffort: this.currentReasoningEffort,
+    });
   }
 
   private sendExecutorConnected(ws?: Bun.ServerWebSocket<SocketData>): void {
-    const message = { type: "executor_connected", executorId: this.executorId ?? "local-executor", registeredToolCount: this.tools.size, guidanceInventory: [], resumeBootstrap: false };
+    const message = {
+      type: "executor_connected",
+      executorId: this.executorId ?? "local-executor",
+      registeredToolCount: this.tools.size,
+      guidanceInventory: [],
+      resumeBootstrap: false,
+    };
     if (ws) sendProtocol(ws, message);
     else this.broadcast(message);
   }
@@ -506,7 +795,8 @@ export class LocalThreadActor {
   private registerTools(rawTools: unknown): void {
     for (const raw of Array.isArray(rawTools) ? rawTools : []) {
       const tool = jsonRecord(raw) as unknown as NeoToolSpec;
-      if (typeof tool.name === "string") this.tools.set(tool.name, { ...tool, inputSchema: jsonRecord(tool.inputSchema) });
+      if (typeof tool.name === "string")
+        this.tools.set(tool.name, { ...tool, inputSchema: jsonRecord(tool.inputSchema) });
     }
   }
 
@@ -534,7 +824,13 @@ export class LocalThreadActor {
   }
 
   private rejectExecutorSpawn(msg: JsonRecord): void {
-    this.broadcast({ type: "executor_status", spawnId: typeof msg.requestId === "string" ? msg.requestId : undefined, status: "failed", message: "Local connector runtime does not spawn remote executors", details: { reasonCode: "spawn_rejected" } });
+    this.broadcast({
+      type: "executor_status",
+      spawnId: typeof msg.requestId === "string" ? msg.requestId : undefined,
+      status: "failed",
+      message: "Local connector runtime does not spawn remote executors",
+      details: { reasonCode: "spawn_rejected" },
+    });
   }
 
   private storeMessage(message: NeoThreadMessage): NeoThreadMessage & { seq: number } {
@@ -553,8 +849,26 @@ export class LocalThreadActor {
   private rebuildHistory(): void {
     this.history = [];
     for (const message of this.messages.sort((a, b) => a.seq - b.seq)) {
-      if (message.role === "assistant") this.history.push({ role: "assistant", text: textFromBlocks(message.content), toolCalls: message.content.filter((block): block is NeoToolUseBlock => jsonRecord(block).type === "tool_use").map((block) => ({ id: block.id, name: block.name, input: block.input })) });
-      if (message.role === "user") this.history.push(...message.content.map((block) => jsonRecord(block).type === "tool_result" ? { role: "tool" as const, toolCallId: String(jsonRecord(block).toolUseID ?? ""), text: runToText(jsonRecord(block).run) } : { role: "user" as const, text: textFromBlocks([block]) }));
+      if (message.role === "assistant")
+        this.history.push({
+          role: "assistant",
+          text: textFromBlocks(message.content),
+          toolCalls: message.content
+            .filter((block): block is NeoToolUseBlock => jsonRecord(block).type === "tool_use")
+            .map((block) => ({ id: block.id, name: block.name, input: block.input })),
+        });
+      if (message.role === "user")
+        this.history.push(
+          ...message.content.map((block) =>
+            jsonRecord(block).type === "tool_result"
+              ? {
+                  role: "tool" as const,
+                  toolCallId: String(jsonRecord(block).toolUseID ?? ""),
+                  text: runToText(jsonRecord(block).run),
+                }
+              : { role: "user" as const, text: textFromBlocks([block]) },
+          ),
+        );
     }
   }
 
@@ -562,7 +876,12 @@ export class LocalThreadActor {
     for (const ws of this.sockets) sendProtocol(ws, message);
   }
 
-  private setAgentState(state: string, messageId?: string, agentMode = this.agentMode(), reasoningEffort?: string): void {
+  private setAgentState(
+    state: string,
+    messageId?: string,
+    agentMode = this.agentMode(),
+    reasoningEffort?: string,
+  ): void {
     this.agentState = state;
     this.broadcast({ type: "agent_state", state, messageId, agentMode, reasoningEffort });
   }
@@ -583,12 +902,20 @@ export class LocalThreadActor {
   }
 
   private steerQueuedMessage(messageId: string): void {
-    this.broadcast({ type: "queued_messages", messages: this.queue.map((queuedMessage) => ({ steer: queuedMessage.messageId === messageId, queuedMessage })) });
+    this.broadcast({
+      type: "queued_messages",
+      messages: this.queue.map((queuedMessage) => ({ steer: queuedMessage.messageId === messageId, queuedMessage })),
+    });
   }
 
   private cancel(): void {
     this.generation++;
-    const messageId = this.activeAssistantMessageId ?? this.messages.findLast((message) => message.role === "assistant")?.messageId;
+    if (this.inferenceAbort) {
+      this.inferenceAbort.abort();
+      this.inferenceAbort = null;
+    }
+    const messageId =
+      this.activeAssistantMessageId ?? this.messages.findLast((message) => message.role === "assistant")?.messageId;
     this.pendingTools.clear();
     this.approvals.clear();
     this.broadcastApprovalQueue();
@@ -622,7 +949,12 @@ export class LocalThreadActor {
   }
 
   private broadcastObservers(): void {
-    this.broadcast({ type: "observers", count: this.sockets.size, observers: [], hasExecutor: Boolean(this.executorId) });
+    this.broadcast({
+      type: "observers",
+      count: this.sockets.size,
+      observers: [],
+      hasExecutor: Boolean(this.executorId),
+    });
   }
 
   private broadcastApprovalQueue(): void {
@@ -639,13 +971,17 @@ export class LocalThreadActor {
 
   private agentMode(): string {
     if (typeof this.settings.agentMode === "string") return this.settings.agentMode;
-    const firstMode = this.messages.find((message) => message.role === "user" && typeof message.agentMode === "string")?.agentMode;
+    const firstMode = this.messages.find(
+      (message) => message.role === "user" && typeof message.agentMode === "string",
+    )?.agentMode;
     return firstMode ?? this.currentAgentMode ?? "smart";
   }
 
   private reasoningEffort(): string | undefined {
     if (typeof this.settings["reasoning.effort"] === "string") return this.settings["reasoning.effort"];
-    const firstEffort = this.messages.find((message) => message.role === "user" && typeof message.reasoningEffort === "string")?.reasoningEffort;
+    const firstEffort = this.messages.find(
+      (message) => message.role === "user" && typeof message.reasoningEffort === "string",
+    )?.reasoningEffort;
     return firstEffort ?? this.currentReasoningEffort;
   }
 }

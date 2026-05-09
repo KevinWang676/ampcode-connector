@@ -94,7 +94,9 @@ export class NeoLocalPersistence {
       .filter((actor) => !actor.snapshot.cloud?.archived && !actor.snapshot.cloud?.deleted)
       .filter((actor) => {
         if (!q) return true;
-        const haystack = [actor.snapshot.threadId, actor.snapshot.title, renderThreadMarkdown(actor)].join("\n").toLowerCase();
+        const haystack = [actor.snapshot.threadId, actor.snapshot.title, renderThreadMarkdown(actor)]
+          .join("\n")
+          .toLowerCase();
         return haystack.includes(q);
       })
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
@@ -135,7 +137,14 @@ export class NeoLocalPersistence {
 
 export function renderThreadMarkdown(actor: PersistedActorState): string {
   const title = actor.snapshot.title ?? localThreadTitle(actor);
-  const lines = [`# ${title}`, "", `Thread: ${actor.snapshot.threadId}`, `Actor: ${actor.id}`, `Updated: ${actor.updatedAt}`, ""];
+  const lines = [
+    `# ${title}`,
+    "",
+    `Thread: ${actor.snapshot.threadId}`,
+    `Actor: ${actor.id}`,
+    `Updated: ${actor.updatedAt}`,
+    "",
+  ];
 
   for (const message of actor.snapshot.messages.sort((a, b) => a.seq - b.seq)) {
     lines.push(`## ${message.role.toUpperCase()} — ${message.messageId}`, "");
@@ -149,9 +158,12 @@ function renderBlocks(blocks: unknown[]): string {
   const parts = blocks.map((block) => {
     if (!isRecord(block)) return String(block);
     if (block.type === "text") return String(block.text ?? "");
-    if (block.type === "tool_use") return `Tool call: ${block.name ?? "unknown"}\n\`\`\`json\n${JSON.stringify(block.input ?? {}, null, 2)}\n\`\`\``;
-    if (block.type === "tool_result") return `Tool result (${block.toolUseID ?? "unknown"}):\n\`\`\`\n${runToText(block.run)}\n\`\`\``;
-    if (block.type === "manual_bash_invocation") return `Manual bash invocation:\n\`\`\`json\n${JSON.stringify(block.args ?? {}, null, 2)}\n\`\`\``;
+    if (block.type === "tool_use")
+      return `Tool call: ${block.name ?? "unknown"}\n\`\`\`json\n${JSON.stringify(block.input ?? {}, null, 2)}\n\`\`\``;
+    if (block.type === "tool_result")
+      return `Tool result (${block.toolUseID ?? "unknown"}):\n\`\`\`\n${runToText(block.run)}\n\`\`\``;
+    if (block.type === "manual_bash_invocation")
+      return `Manual bash invocation:\n\`\`\`json\n${JSON.stringify(block.args ?? {}, null, 2)}\n\`\`\``;
     return `\`\`\`json\n${JSON.stringify(block, null, 2)}\n\`\`\``;
   });
   return parts.join("\n\n").trim();
@@ -160,20 +172,27 @@ function renderBlocks(blocks: unknown[]): string {
 function persistedActorFromCloudThread(thread: JsonRecord, existing: PersistedActorState | null): PersistedActorState {
   const threadId = String(thread.id);
   const now = new Date().toISOString();
-  const created = typeof thread.created === "number" ? new Date(thread.created).toISOString() : existing?.record.create_ts ?? now;
+  const created =
+    typeof thread.created === "number" ? new Date(thread.created).toISOString() : (existing?.record.create_ts ?? now);
   const messages = cloudMessages(thread).map((raw, index) => cloudMessageFromRaw(raw, threadId, index));
   const snapshot: LocalActorSnapshot = {
     version: 1,
     actorId: existing?.id ?? newActorId(),
     threadId,
-    settings: { ...existing?.snapshot.settings, ...(typeof thread.agentMode === "string" ? { agentMode: thread.agentMode } : {}) },
+    settings: {
+      ...existing?.snapshot.settings,
+      ...(typeof thread.agentMode === "string" ? { agentMode: thread.agentMode } : {}),
+    },
     messages,
-    history: messages.map((message) => ({ role: message.role === "assistant" ? "assistant" : "user", text: textFromBlocks(message.content) })),
+    history: messages.map((message) => ({
+      role: message.role === "assistant" ? "assistant" : "user",
+      text: textFromBlocks(message.content),
+    })),
     queue: existing?.snapshot.queue ?? [],
     seq: Math.max(Number(thread.v) || 0, messages.length + 1, existing?.snapshot.seq ?? 0),
     agentState: "idle",
     environment: cloudEnvironment(thread, existing),
-    title: typeof thread.title === "string" ? thread.title : existing?.snapshot.title ?? null,
+    title: typeof thread.title === "string" ? thread.title : (existing?.snapshot.title ?? null),
     cloud: { ...existing?.snapshot.cloud, meta: jsonRecord(thread.meta) },
     updatedAt: now,
   };
@@ -190,7 +209,7 @@ function persistedActorFromCloudThread(thread: JsonRecord, existing: PersistedAc
 
 function cloudEnvironment(thread: JsonRecord, existing: PersistedActorState | null): JsonRecord {
   const env = jsonRecord(thread.env);
-  return Object.keys(env).length > 0 ? env : existing?.snapshot.environment ?? {};
+  return Object.keys(env).length > 0 ? env : (existing?.snapshot.environment ?? {});
 }
 
 function cloudMessages(thread: JsonRecord): JsonRecord[] {
@@ -203,21 +222,33 @@ function cloudMessageFromRaw(msg: JsonRecord, threadId: string, index: number): 
   return {
     threadId,
     role,
-    messageId: typeof msg.messageId === "string" ? msg.messageId : typeof msg.protocolMessageID === "string" ? msg.protocolMessageID : newMessageId(),
+    messageId:
+      typeof msg.messageId === "string"
+        ? msg.messageId
+        : typeof msg.protocolMessageID === "string"
+          ? msg.protocolMessageID
+          : newMessageId(),
     content: Array.isArray(msg.content) ? msg.content : [],
     agentMode: typeof msg.agentMode === "string" ? msg.agentMode : undefined,
     reasoningEffort: typeof msg.reasoningEffort === "string" ? msg.reasoningEffort : undefined,
     createdAt: typeof msg.createdAt === "string" ? msg.createdAt : undefined,
     meta: jsonRecord(msg.meta),
     userState: msg.userState,
-    state: role === "assistant" ? (jsonRecord(msg.state).type ? (jsonRecord(msg.state) as NeoThreadMessage["state"]) : { type: "complete", stopReason: "end_turn" }) : undefined,
+    state:
+      role === "assistant"
+        ? jsonRecord(msg.state).type
+          ? (jsonRecord(msg.state) as NeoThreadMessage["state"])
+          : { type: "complete", stopReason: "end_turn" }
+        : undefined,
     usage: jsonRecord(msg.usage),
     seq: index + 1,
   };
 }
 
 function localThreadTitle(actor: PersistedActorState): string {
-  const firstUser = actor.snapshot.messages.find((message) => message.role === "user" && textFromBlocks(message.content).trim());
+  const firstUser = actor.snapshot.messages.find(
+    (message) => message.role === "user" && textFromBlocks(message.content).trim(),
+  );
   const text = firstUser ? textFromBlocks(firstUser.content).replace(/\s+/g, " ").trim() : actor.snapshot.threadId;
   return text.length > 80 ? `${text.slice(0, 77)}...` : text;
 }
@@ -233,5 +264,7 @@ function safeName(value: string): string {
 function isPersistedActorState(value: unknown): value is PersistedActorState {
   if (!isRecord(value)) return false;
   const snapshot = value.snapshot;
-  return value.version === 1 && typeof value.id === "string" && isRecord(snapshot) && typeof snapshot.threadId === "string";
+  return (
+    value.version === 1 && typeof value.id === "string" && isRecord(snapshot) && typeof snapshot.threadId === "string"
+  );
 }
