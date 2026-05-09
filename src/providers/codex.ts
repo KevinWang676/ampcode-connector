@@ -185,13 +185,28 @@ interface ToolCallItem {
   function: { name: string; arguments: string };
 }
 
-function clampReasoningEffort(model: string, effort: string): string {
+/** Clamp the reasoning_effort label to a value the target model accepts.
+ *
+ *  OpenAI gpt-5 reasoning models accept "minimal" | "low" | "medium" | "high".
+ *  Codex CLI also extends some models with "xhigh". This helper normalizes the
+ *  outgoing value per known model quirks while leaving everything else as-is.
+ *
+ *  Known clamps:
+ *  - gpt-5.1: rejects "xhigh"; clamp to "high".
+ *  - gpt-5.2 / gpt-5.3: reject "minimal"; clamp to "low".
+ *  - gpt-5.1-codex-mini: only "medium" or "high".
+ *  - gpt-5.4 / gpt-5.5 (and any future gpt-5.x): support the full
+ *    minimal/low/medium/high set; downgrade "xhigh" → "high" since "xhigh" is
+ *    a Codex-CLI extension that the server may not accept.
+ *  - All other models: pass effort through unchanged. */
+export function clampReasoningEffort(model: string, effort: string): string {
   const modelId = model.includes("/") ? model.split("/").pop()! : model;
   if (modelId === "gpt-5.1" && effort === "xhigh") return "high";
   if ((modelId.startsWith("gpt-5.2") || modelId.startsWith("gpt-5.3")) && effort === "minimal") return "low";
   if (modelId === "gpt-5.1-codex-mini") {
     return effort === "high" || effort === "xhigh" ? "high" : "medium";
   }
+  if (modelId.startsWith("gpt-5") && effort === "xhigh") return "high";
   return effort;
 }
 

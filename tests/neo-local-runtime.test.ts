@@ -4,9 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { cloudThreadFromActor } from "../src/server/neo-cloud-sync.ts";
 import { LocalThreadActor, localFindThreadRun, localReadThreadRun } from "../src/server/neo-local-actor.ts";
+import { clampReasoningEffort } from "../src/providers/codex.ts";
 import {
   anthropicMaxOutputTokens,
+  anthropicThinking,
   googleMaxOutputTokens,
+  openAIReasoningEffort,
   parseAnthropicSse,
   parseOpenAISse,
   selectModelRoute,
@@ -365,6 +368,80 @@ describe("Neo provider max_tokens caps", () => {
     expect(googleMaxOutputTokens("gemini-3-pro-preview")).toBeGreaterThanOrEqual(32000);
     expect(googleMaxOutputTokens("gemini-2.5-flash")).toBeGreaterThanOrEqual(32000);
     expect(googleMaxOutputTokens("unknown-future-gemini")).toBeGreaterThanOrEqual(32000);
+  });
+});
+
+describe("Neo Anthropic adaptive thinking", () => {
+  test("turns thinking ON by default for Claude Opus 4.x and Sonnet 4.x", () => {
+    const opus = anthropicThinking("claude-opus-4-7", undefined, 32000);
+    expect(opus?.type).toBe("enabled");
+    expect(opus?.budget_tokens).toBeGreaterThanOrEqual(1024);
+    expect(opus?.budget_tokens).toBeLessThan(32000);
+
+    const sonnet = anthropicThinking("claude-sonnet-4-5", undefined, 32000);
+    expect(sonnet?.type).toBe("enabled");
+  });
+
+  test("leaves thinking OFF by default for Claude Haiku 4.x (rush mode)", () => {
+    expect(anthropicThinking("claude-haiku-4-5-20251001", undefined, 64000)).toBeUndefined();
+  });
+
+  test("scales budget_tokens with reasoning effort", () => {
+    const low = anthropicThinking("claude-opus-4-7", "low", 32000);
+    const med = anthropicThinking("claude-opus-4-7", "medium", 32000);
+    const high = anthropicThinking("claude-opus-4-7", "high", 32000);
+    const xhigh = anthropicThinking("claude-opus-4-7", "xhigh", 32000);
+    expect(low?.budget_tokens).toBeLessThan(med?.budget_tokens ?? 0);
+    expect(med?.budget_tokens).toBeLessThan(high?.budget_tokens ?? 0);
+    expect(high?.budget_tokens).toBeLessThanOrEqual(xhigh?.budget_tokens ?? 0);
+  });
+
+  test("returns undefined when effort is minimal/none", () => {
+    expect(anthropicThinking("claude-opus-4-7", "minimal", 32000)).toBeUndefined();
+    expect(anthropicThinking("claude-opus-4-7", "none", 32000)).toBeUndefined();
+  });
+
+  test("reserves enough headroom in max_tokens for the visible response", () => {
+    // With max_tokens=32000 and our 16384 reserve, even the highest tier must
+    // leave >= 16384 tokens free for the assistant's tool_use/text response.
+    const xhigh = anthropicThinking("claude-opus-4-7", "xhigh", 32000);
+    expect(xhigh?.budget_tokens ?? 0).toBeLessThanOrEqual(32000 - 16384);
+  });
+
+  test("returns undefined for older Claude families that lack extended thinking", () => {
+    expect(anthropicThinking("claude-3-5-sonnet-20241022", "high", 32000)).toBeUndefined();
+    expect(anthropicThinking("claude-3-haiku-20240307", undefined, 32000)).toBeUndefined();
+  });
+});
+
+describe("Neo OpenAI reasoning effort", () => {
+  test("preserves minimal/low/medium/high/xhigh as the Responses API expects", () => {
+    expect(openAIReasoningEffort("minimal")).toBe("minimal");
+    expect(openAIReasoningEffort("none")).toBe("minimal");
+    expect(openAIReasoningEffort("low")).toBe("low");
+    expect(openAIReasoningEffort("medium")).toBe("medium");
+    expect(openAIReasoningEffort("high")).toBe("high");
+    expect(openAIReasoningEffort("xhigh")).toBe("xhigh");
+    expect(openAIReasoningEffort("max")).toBe("xhigh");
+    expect(openAIReasoningEffort(undefined)).toBe("medium");
+    expect(openAIReasoningEffort("garbage-input")).toBe("medium");
+  });
+
+  test("clampReasoningEffort honors gpt-5.5 minimal/low/medium/high", () => {
+    expect(clampReasoningEffort("gpt-5.5", "minimal")).toBe("minimal");
+    expect(clampReasoningEffort("gpt-5.5", "low")).toBe("low");
+    expect(clampReasoningEffort("gpt-5.5", "medium")).toBe("medium");
+    expect(clampReasoningEffort("gpt-5.5", "high")).toBe("high");
+    // gpt-5.5 doesn't accept xhigh — clamp to high.
+    expect(clampReasoningEffort("gpt-5.5", "xhigh")).toBe("high");
+  });
+
+  test("clampReasoningEffort retains legacy gpt-5.1 / 5.2 / 5.3 quirks", () => {
+    expect(clampReasoningEffort("gpt-5.1", "xhigh")).toBe("high");
+    expect(clampReasoningEffort("gpt-5.2", "minimal")).toBe("low");
+    expect(clampReasoningEffort("gpt-5.3", "minimal")).toBe("low");
+    expect(clampReasoningEffort("gpt-5.1-codex-mini", "low")).toBe("medium");
+    expect(clampReasoningEffort("gpt-5.1-codex-mini", "high")).toBe("high");
   });
 });
 

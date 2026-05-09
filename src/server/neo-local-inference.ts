@@ -164,6 +164,66 @@ export function anthropicMaxOutputTokens(model: string): number {
   return 32000;
 }
 
+/** Extended-thinking ("adaptive thinking") config for Anthropic.
+ *
+ *  Returns `{type: "enabled", budget_tokens: N}` for Claude 4.x models that
+ *  support extended thinking. The budget scales with reasoning effort and
+ *  always reserves enough headroom inside max_tokens so a large tool_use input
+ *  (e.g. create_file with thousands of lines) can still fit alongside the
+ *  thinking blocks.
+ *
+ *  Defaults:
+ *  - claude-opus-4.x / claude-sonnet-4.x → ON (medium) when no effort is set.
+ *    Opus 4.7 (smart mode) gets adaptive thinking by default.
+ *  - claude-haiku-4.x → OFF unless reasoningEffort is explicitly set, since
+ *    rush mode is meant for fast turnaround.
+ *  - older Claude families → OFF (extended thinking unsupported).
+ *
+ *  Returns `undefined` to omit the `thinking` field entirely. */
+export function anthropicThinking(
+  model: string,
+  reasoningEffort: string | undefined,
+  maxTokens: number,
+): { type: "enabled"; budget_tokens: number } | undefined {
+  const m = model.toLowerCase();
+  const supportsThinking = m.includes("claude-opus-4") || m.includes("claude-sonnet-4") || m.includes("claude-haiku-4");
+  if (!supportsThinking) return undefined;
+
+  let effort = reasoningEffort?.toLowerCase();
+  if (!effort) {
+    // Default ON for the heavyweight families, OFF for haiku.
+    if (m.includes("claude-opus-4") || m.includes("claude-sonnet-4")) effort = "medium";
+    else return undefined;
+  }
+  if (effort === "minimal" || effort === "none") return undefined;
+
+  // Reserve enough output budget for visible response so big tool inputs
+  // (e.g. file contents) cannot get squeezed out by thinking.
+  const reserveForResponse = 16384;
+  const budgetCap = Math.max(1024, maxTokens - reserveForResponse);
+
+  let budget: number;
+  switch (effort) {
+    case "low":
+      budget = 2048;
+      break;
+    case "high":
+      budget = 12288;
+      break;
+    case "xhigh":
+    case "max":
+      budget = 24576;
+      break;
+    case "medium":
+    default:
+      budget = 6144;
+      break;
+  }
+  budget = Math.min(budget, budgetCap);
+  if (budget < 1024) return undefined;
+  return { type: "enabled", budget_tokens: budget };
+}
+
 async function inferAnthropic(
   config: ProxyConfig,
   request: LocalInferenceRequest,
@@ -171,10 +231,13 @@ async function inferAnthropic(
   handler?: InferenceStreamHandler,
 ): Promise<LocalInferenceResult> {
   const streaming = !!handler;
+  const maxTokens = anthropicMaxOutputTokens(route.model);
+  const thinking = anthropicThinking(route.model, request.reasoningEffort, maxTokens);
   const body = {
     model: route.model,
-    max_tokens: anthropicMaxOutputTokens(route.model),
+    max_tokens: maxTokens,
     stream: streaming,
+    ...(thinking ? { thinking } : {}),
     system: [{ type: "text", text: systemPrompt(request) }],
     messages: anthropicMessages(request.history),
     ...(request.tools.length > 0
@@ -862,11 +925,30 @@ function toGoogleFunctionDeclaration(tool: NeoToolSpec): JsonRecord {
   return { name: tool.name, description: tool.description ?? "", parameters: tool.inputSchema ?? { type: "object" } };
 }
 
-function openAIReasoningEffort(effort?: string): string {
-  if (effort === "low" || effort === "medium" || effort === "high") return effort;
-  if (effort === "xhigh" || effort === "max") return "high";
-  if (effort === "minimal" || effort === "none") return "low";
-  return "medium";
+/** Normalize an Amp reasoning effort label to the OpenAI Responses-API value.
+ *
+ *  Modern OpenAI/Codex reasoning models (gpt-5, gpt-5.x including gpt-5.5)
+ *  accept "minimal" | "low" | "medium" | "high". The Codex CLI also uses
+ *  "xhigh" as an extension for some models; downstream `clampReasoningEffort`
+ *  in providers/codex.ts is responsible for downgrading "xhigh" or "minimal"
+ *  for any model that does not support them. */
+export function openAIReasoningEffort(effort?: string): string {
+  switch (effort) {
+    case "minimal":
+    case "none":
+      return "minimal";
+    case "low":
+      return "low";
+    case "high":
+      return "high";
+    case "xhigh":
+    case "max":
+      return "xhigh";
+    case "medium":
+      return "medium";
+    default:
+      return "medium";
+  }
 }
 
 function parseToolArguments(value: unknown): JsonRecord {
