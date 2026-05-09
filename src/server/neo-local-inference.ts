@@ -164,22 +164,48 @@ export function anthropicMaxOutputTokens(model: string): number {
   return 32000;
 }
 
+/** Anthropic extended-thinking constraints.
+ *
+ *  Hard constraints (enforced by api.anthropic.com — violating these returns
+ *  400 Bad Request, breaking the whole turn):
+ *    1. budget_tokens >= 1024 (Anthropic's documented minimum)
+ *    2. budget_tokens <  max_tokens (strict less-than, NOT less-or-equal)
+ *
+ *  Soft constraint (enforced by us so the model has room to emit a full
+ *  visible response — including a large tool_use input like create_file with a
+ *  multi-thousand-line content arg — even if the model fills its full thinking
+ *  budget):
+ *    3. budget_tokens <= max_tokens − ANTHROPIC_THINKING_RESPONSE_RESERVE
+ *
+ *  8192 is enough for ~800 lines of code-style content, which is the practical
+ *  upper bound for a single tool call in this codebase. */
+const ANTHROPIC_THINKING_MIN_BUDGET = 1024;
+const ANTHROPIC_THINKING_RESPONSE_RESERVE = 8192;
+
+/** Per-effort thinking budget targets (Anthropic-recommended ranges). The
+ *  upper bound is enforced separately so these tiers stay valid across all
+ *  Claude 4.x models including future variants with different max_tokens. */
+const ANTHROPIC_THINKING_TIERS: Readonly<Record<string, number>> = {
+  low: 2048,
+  medium: 6144,
+  high: 16384,
+  xhigh: 24576,
+  max: 24576,
+};
+
 /** Extended-thinking ("adaptive thinking") config for Anthropic.
  *
- *  Returns `{type: "enabled", budget_tokens: N}` for Claude 4.x models that
- *  support extended thinking. The budget scales with reasoning effort and
- *  always reserves enough headroom inside max_tokens so a large tool_use input
- *  (e.g. create_file with thousands of lines) can still fit alongside the
- *  thinking blocks.
+ *  Returns `{type: "enabled", budget_tokens: N}` when the model supports
+ *  extended thinking AND the math works out within the constraints above;
+ *  otherwise returns `undefined` so the caller omits the `thinking` field
+ *  entirely (the API rejects `{type: "enabled", budget_tokens: 0}`).
  *
  *  Defaults:
  *  - claude-opus-4.x / claude-sonnet-4.x → ON (medium) when no effort is set.
  *    Opus 4.7 (smart mode) gets adaptive thinking by default.
  *  - claude-haiku-4.x → OFF unless reasoningEffort is explicitly set, since
  *    rush mode is meant for fast turnaround.
- *  - older Claude families → OFF (extended thinking unsupported).
- *
- *  Returns `undefined` to omit the `thinking` field entirely. */
+ *  - older Claude families → OFF (extended thinking unsupported). */
 export function anthropicThinking(
   model: string,
   reasoningEffort: string | undefined,
@@ -197,30 +223,20 @@ export function anthropicThinking(
   }
   if (effort === "minimal" || effort === "none") return undefined;
 
-  // Reserve enough output budget for visible response so big tool inputs
-  // (e.g. file contents) cannot get squeezed out by thinking.
-  const reserveForResponse = 16384;
-  const budgetCap = Math.max(1024, maxTokens - reserveForResponse);
+  // Enforce Anthropic's hard constraints AND our visible-response reserve.
+  // Use the tighter of the two upper bounds.
+  const upperBound = Math.min(maxTokens - ANTHROPIC_THINKING_RESPONSE_RESERVE, maxTokens - 1);
+  if (upperBound < ANTHROPIC_THINKING_MIN_BUDGET) return undefined;
 
-  let budget: number;
-  switch (effort) {
-    case "low":
-      budget = 2048;
-      break;
-    case "high":
-      budget = 12288;
-      break;
-    case "xhigh":
-    case "max":
-      budget = 24576;
-      break;
-    case "medium":
-    default:
-      budget = 6144;
-      break;
-  }
-  budget = Math.min(budget, budgetCap);
-  if (budget < 1024) return undefined;
+  const target = ANTHROPIC_THINKING_TIERS[effort] ?? ANTHROPIC_THINKING_TIERS.medium;
+  if (target === undefined) return undefined;
+
+  // Clamp into [MIN, upperBound]. Floor wins if the clamp would push below
+  // Anthropic's minimum — in that case extended thinking can't be requested
+  // safely, so we omit the field rather than send an invalid request.
+  const budget = Math.min(target, upperBound);
+  if (budget < ANTHROPIC_THINKING_MIN_BUDGET) return undefined;
+
   return { type: "enabled", budget_tokens: budget };
 }
 

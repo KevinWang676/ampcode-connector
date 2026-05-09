@@ -372,28 +372,59 @@ describe("Neo provider max_tokens caps", () => {
 });
 
 describe("Neo Anthropic adaptive thinking", () => {
+  /** Anthropic's hard constraints. Any returned config must satisfy both. */
+  function expectValidBudget(
+    cfg: { type: "enabled"; budget_tokens: number } | undefined,
+    maxTokens: number,
+  ): asserts cfg is { type: "enabled"; budget_tokens: number } {
+    expect(cfg).toBeDefined();
+    expect(cfg?.type).toBe("enabled");
+    expect(cfg?.budget_tokens).toBeGreaterThanOrEqual(1024);
+    // Strict less-than: api.anthropic.com rejects budget_tokens === max_tokens.
+    expect(cfg?.budget_tokens).toBeLessThan(maxTokens);
+  }
+
   test("turns thinking ON by default for Claude Opus 4.x and Sonnet 4.x", () => {
     const opus = anthropicThinking("claude-opus-4-7", undefined, 32000);
-    expect(opus?.type).toBe("enabled");
-    expect(opus?.budget_tokens).toBeGreaterThanOrEqual(1024);
-    expect(opus?.budget_tokens).toBeLessThan(32000);
+    expectValidBudget(opus, 32000);
 
     const sonnet = anthropicThinking("claude-sonnet-4-5", undefined, 32000);
-    expect(sonnet?.type).toBe("enabled");
+    expectValidBudget(sonnet, 32000);
   });
 
   test("leaves thinking OFF by default for Claude Haiku 4.x (rush mode)", () => {
     expect(anthropicThinking("claude-haiku-4-5-20251001", undefined, 64000)).toBeUndefined();
   });
 
-  test("scales budget_tokens with reasoning effort", () => {
+  test("budget_tokens is strictly monotonic in effort for Opus 4.7", () => {
     const low = anthropicThinking("claude-opus-4-7", "low", 32000);
     const med = anthropicThinking("claude-opus-4-7", "medium", 32000);
     const high = anthropicThinking("claude-opus-4-7", "high", 32000);
     const xhigh = anthropicThinking("claude-opus-4-7", "xhigh", 32000);
-    expect(low?.budget_tokens).toBeLessThan(med?.budget_tokens ?? 0);
-    expect(med?.budget_tokens).toBeLessThan(high?.budget_tokens ?? 0);
-    expect(high?.budget_tokens).toBeLessThanOrEqual(xhigh?.budget_tokens ?? 0);
+    expectValidBudget(low, 32000);
+    expectValidBudget(med, 32000);
+    expectValidBudget(high, 32000);
+    expectValidBudget(xhigh, 32000);
+    expect(low.budget_tokens).toBeLessThan(med.budget_tokens);
+    expect(med.budget_tokens).toBeLessThan(high.budget_tokens);
+    expect(high.budget_tokens).toBeLessThanOrEqual(xhigh.budget_tokens);
+  });
+
+  test("Opus 4.7 + xhigh gives the model close to the 24576 target without violating constraints", () => {
+    const xhigh = anthropicThinking("claude-opus-4-7", "xhigh", 32000);
+    expectValidBudget(xhigh, 32000);
+    // Must be at least 16384 — substantially more than the previous 15616 cap
+    // when the response reserve was 16384.
+    expect(xhigh.budget_tokens).toBeGreaterThanOrEqual(16384);
+    // Must leave at least 8192 tokens (one response reserve) free for the
+    // visible response.
+    expect(xhigh.budget_tokens).toBeLessThanOrEqual(32000 - 8192);
+  });
+
+  test("Haiku 4.5 + xhigh respects the strict-less-than constraint at maxTokens=64000", () => {
+    const xhigh = anthropicThinking("claude-haiku-4-5-20251001", "xhigh", 64000);
+    expectValidBudget(xhigh, 64000);
+    expect(xhigh.budget_tokens).toBeLessThanOrEqual(64000 - 8192);
   });
 
   test("returns undefined when effort is minimal/none", () => {
@@ -401,16 +432,28 @@ describe("Neo Anthropic adaptive thinking", () => {
     expect(anthropicThinking("claude-opus-4-7", "none", 32000)).toBeUndefined();
   });
 
-  test("reserves enough headroom in max_tokens for the visible response", () => {
-    // With max_tokens=32000 and our 16384 reserve, even the highest tier must
-    // leave >= 16384 tokens free for the assistant's tool_use/text response.
-    const xhigh = anthropicThinking("claude-opus-4-7", "xhigh", 32000);
-    expect(xhigh?.budget_tokens ?? 0).toBeLessThanOrEqual(32000 - 16384);
+  test("returns undefined for degenerate maxTokens that cannot fit MIN budget + reserve", () => {
+    // 8192 (reserve) + 1024 (min) = 9216. Anything below that must opt out.
+    expect(anthropicThinking("claude-opus-4-7", "high", 9215)).toBeUndefined();
+    expect(anthropicThinking("claude-opus-4-7", "high", 8192)).toBeUndefined();
+    expect(anthropicThinking("claude-opus-4-7", "high", 1024)).toBeUndefined();
   });
 
   test("returns undefined for older Claude families that lack extended thinking", () => {
     expect(anthropicThinking("claude-3-5-sonnet-20241022", "high", 32000)).toBeUndefined();
     expect(anthropicThinking("claude-3-haiku-20240307", undefined, 32000)).toBeUndefined();
+  });
+
+  test("explicit medium and unset effort produce the same result for Opus 4.7", () => {
+    const explicit = anthropicThinking("claude-opus-4-7", "medium", 32000);
+    const implicit = anthropicThinking("claude-opus-4-7", undefined, 32000);
+    expect(explicit).toEqual(implicit);
+  });
+
+  test("unknown effort labels fall back to the medium tier (no API-rejecting output)", () => {
+    const unknown = anthropicThinking("claude-opus-4-7", "garbage-effort", 32000);
+    const medium = anthropicThinking("claude-opus-4-7", "medium", 32000);
+    expect(unknown).toEqual(medium);
   });
 });
 
