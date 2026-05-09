@@ -12,6 +12,7 @@ export interface ProxyConfig {
   ampUpstreamUrl: string;
   ampApiKey?: string;
   exaApiKey?: string;
+  geminiApiKey?: string;
   logLevel: LogLevel;
   providers: {
     anthropic: boolean;
@@ -51,6 +52,7 @@ export async function loadConfig(): Promise<ProxyConfig> {
     ampUpstreamUrl: asString(file?.ampUpstreamUrl) ?? DEFAULTS.ampUpstreamUrl,
     ampApiKey: apiKey,
     exaApiKey: asString(file?.exaApiKey) ?? process.env.EXA_API_KEY,
+    geminiApiKey: asString(file?.geminiApiKey) ?? process.env.GEMINI_API_KEY ?? process.env.GOOGLE_API_KEY,
     logLevel: asLogLevel(file?.logLevel) ?? DEFAULTS.logLevel,
     providers: {
       anthropic: asBool(providers?.anthropic) ?? DEFAULTS.providers.anthropic,

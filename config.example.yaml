@@ -8,6 +8,7 @@ logLevel: info
 # ampUpstreamUrl: https://ampcode.com
 # ampApiKey: ...          # optional override; normally read from ~/.local/share/amp/secrets.json
 # exaApiKey: ...          # or EXA_API_KEY env (for web_search)
+# geminiApiKey: ...       # optional; or GEMINI_API_KEY/GOOGLE_API_KEY env (fallback for Google 429s)
 
 providers:
   anthropic: true

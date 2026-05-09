@@ -159,10 +159,28 @@ export function normalizeNeoUsage(usage: JsonRecord | undefined): JsonRecord | u
   if (!usage || Object.keys(usage).length === 0) return undefined;
 
   const inputTokens = numberFrom(usage.inputTokens, usage.input_tokens, usage.prompt_tokens, usage.promptTokenCount);
-  const outputTokens = numberFrom(usage.outputTokens, usage.output_tokens, usage.completion_tokens, usage.candidatesTokenCount);
-  const cacheCreationInputTokens = nullableNumberFrom(usage.cacheCreationInputTokens, usage.cache_creation_input_tokens);
-  const cacheReadInputTokens = nullableNumberFrom(usage.cacheReadInputTokens, usage.cache_read_input_tokens, usage.cachedContentTokenCount);
-  const totalInputTokens = numberFrom(usage.totalInputTokens, usage.total_input_tokens, usage.prompt_tokens, usage.promptTokenCount, inputTokens + (cacheCreationInputTokens ?? 0) + (cacheReadInputTokens ?? 0));
+  const outputTokens = numberFrom(
+    usage.outputTokens,
+    usage.output_tokens,
+    usage.completion_tokens,
+    usage.candidatesTokenCount,
+  );
+  const cacheCreationInputTokens = nullableNumberFrom(
+    usage.cacheCreationInputTokens,
+    usage.cache_creation_input_tokens,
+  );
+  const cacheReadInputTokens = nullableNumberFrom(
+    usage.cacheReadInputTokens,
+    usage.cache_read_input_tokens,
+    usage.cachedContentTokenCount,
+  );
+  const totalInputTokens = numberFrom(
+    usage.totalInputTokens,
+    usage.total_input_tokens,
+    usage.prompt_tokens,
+    usage.promptTokenCount,
+    inputTokens + (cacheCreationInputTokens ?? 0) + (cacheReadInputTokens ?? 0),
+  );
 
   return {
     model: typeof usage.model === "string" ? usage.model : undefined,

@@ -93,7 +93,7 @@ export function routeRequest(
     const pinned = affinity.get(threadId, ampProvider);
     if (pinned && !cooldown.isExhausted(pinned.pool, pinned.account)) {
       const handler = providerForPool(pinned.pool);
-      if (handler?.isAvailable(pinned.account)) {
+      if (handler?.isAvailable(pinned.account, config)) {
         if (!cooldown.isCoolingDown(pinned.pool, pinned.account)) {
           logger.route(handler.routeDecision, ampProvider, modelStr);
           return result(handler, ampProvider, modelStr, pinned.account, pinned.pool);
@@ -162,7 +162,7 @@ export function buildCandidates(ampProvider: string, config: ProxyConfig): Candi
 
   const candidates: Candidate[] = [];
   for (const entry of reg.entries) {
-    addAccountCandidates(candidates, entry.provider, entry.pool, entry.credentialName);
+    addAccountCandidates(candidates, entry.provider, entry.pool, entry.credentialName, config);
   }
   return candidates;
 }
@@ -172,11 +172,18 @@ function addAccountCandidates(
   provider: Provider,
   pool: QuotaPool,
   providerName: ProviderName,
+  config: ProxyConfig,
 ): void {
+  const seen = new Set<number>();
   for (const { account, credentials } of store.getAll(providerName)) {
-    if (credentials.refreshToken) {
+    if (credentials.refreshToken && provider.isAvailable(account, config)) {
       candidates.push({ provider, pool, account });
+      seen.add(account);
     }
+  }
+  const count = provider.accountCount(config);
+  for (let account = 0; account < count; account++) {
+    if (!seen.has(account) && provider.isAvailable(account, config)) candidates.push({ provider, pool, account });
   }
 }
 

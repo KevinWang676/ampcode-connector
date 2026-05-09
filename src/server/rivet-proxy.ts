@@ -103,7 +103,9 @@ function startHostedRivetProxy(hostname: string, token: string): ReturnType<type
 async function forwardHttp(req: Request, token: string): Promise<Response> {
   const url = new URL(req.url);
   const target = hostedActorsUrl(url, HOSTED_ACTORS_URL);
-  logger.info(`Neo actor proxy HTTP ${JSON.stringify({ method: req.method, path: url.pathname, search: redactSearch(url.search) })}`);
+  logger.info(
+    `Neo actor proxy HTTP ${JSON.stringify({ method: req.method, path: url.pathname, search: redactSearch(url.search) })}`,
+  );
   const headers = copyHeaders(req.headers);
   headers.set("Authorization", `Bearer ${token}`);
   headers.set("Host", new URL(HOSTED_ACTORS_URL).host);
@@ -120,10 +122,17 @@ async function forwardHttp(req: Request, token: string): Promise<Response> {
     const responseHeaders = new Headers(response.headers);
     responseHeaders.delete("Content-Encoding");
     responseHeaders.delete("Content-Length");
-    return new Response(response.body, { status: response.status, statusText: response.statusText, headers: responseHeaders });
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: responseHeaders,
+    });
   } catch (err) {
     logger.error("Neo actor proxy HTTP error", { error: String(err) });
-    return Response.json({ error: "Failed to connect to hosted Amp actor service", details: String(err) }, { status: 502 });
+    return Response.json(
+      { error: "Failed to connect to hosted Amp actor service", details: String(err) },
+      { status: 502 },
+    );
   }
 }
 
@@ -156,11 +165,15 @@ function openUpstreamWebSocket(client: Bun.ServerWebSocket<SocketData>, token: s
     if (client.readyState === WebSocket.OPEN) client.send(event.data as string | ArrayBuffer | Uint8Array);
   });
   upstream.addEventListener("close", (event) => {
-    logger.warn(`Neo actor proxy upstream WebSocket close ${JSON.stringify({ code: event.code, reason: event.reason })}`);
+    logger.warn(
+      `Neo actor proxy upstream WebSocket close ${JSON.stringify({ code: event.code, reason: event.reason })}`,
+    );
     if (client.readyState === WebSocket.OPEN) client.close(event.code, event.reason);
   });
   upstream.addEventListener("error", () => {
-    logger.error(`Neo actor proxy upstream WebSocket error ${JSON.stringify({ targetUrl: redactActorUrl(client.data.targetUrl) })}`);
+    logger.error(
+      `Neo actor proxy upstream WebSocket error ${JSON.stringify({ targetUrl: redactActorUrl(client.data.targetUrl) })}`,
+    );
     if (client.readyState === WebSocket.OPEN) client.close(1011, "Hosted actor websocket error");
   });
 

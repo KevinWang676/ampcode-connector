@@ -34,7 +34,7 @@ export const provider: Provider = {
 
   accountCount: () => oauth.accountCount(config),
 
-  async forward(sub, body, originalHeaders, rewrite, account = 0) {
+  async forward(sub, body, originalHeaders, rewrite, account = 0, _proxyConfig, signal) {
     const accessToken = await oauth.token(config, account);
     if (!accessToken) return denied("Anthropic");
 
@@ -50,6 +50,7 @@ export const provider: Provider = {
       providerName: "Anthropic",
       rewrite,
       email: credentials?.email,
+      signal,
       headers: {
         // Client headers first (stainless, accept, content-type, anthropic-version, etc.)
         ...clientHeaders,

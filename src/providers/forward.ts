@@ -12,6 +12,7 @@ export interface ForwardOptions {
   providerName: string;
   rewrite?: (data: string) => string;
   email?: string;
+  signal?: AbortSignal;
 }
 
 const RETRYABLE_STATUS = new Set([408, 500, 502, 503, 504]);
@@ -46,6 +47,7 @@ export async function forward(opts: ForwardOptions): Promise<Response> {
         method: "POST",
         headers: opts.headers,
         body: requestBody,
+        signal: opts.signal,
       });
     } catch (err) {
       if (attempt < MAX_RETRIES) {
