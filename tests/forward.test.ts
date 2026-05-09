@@ -371,6 +371,90 @@ describe("prepareAnthropicBody", () => {
     const prepared = JSON.parse(prepareAnthropicBody(body)) as Record<string, unknown>;
     expect(prepared.thinking).toEqual(thinking);
   });
+
+  test("injects billing header and Claude Code identity as the first two system blocks", () => {
+    const body = parseBody(
+      JSON.stringify({
+        max_tokens: 4096,
+        messages: [{ role: "user", content: "hello world" }],
+        system: [{ type: "text", text: "You are an Amp coding agent." }],
+      }),
+      "/v1/messages",
+    );
+
+    const prepared = JSON.parse(prepareAnthropicBody(body)) as { system: Array<{ type: string; text: string }> };
+    expect(prepared.system[0]?.text).toMatch(
+      /^x-anthropic-billing-header: cc_version=\d+\.\d+\.\d+\.[0-9a-f]{3}; cc_entrypoint=cli; cch=[0-9a-f]{5};$/,
+    );
+    expect(prepared.system[1]?.text).toBe("You are Claude Code, Anthropic's official CLI for Claude.");
+    expect(prepared.system[2]?.text).toBe("You are an Amp coding agent.");
+  });
+
+  test("wraps a string system prompt into [billing, identity, original] blocks", () => {
+    const body = parseBody(
+      JSON.stringify({
+        max_tokens: 4096,
+        messages: [{ role: "user", content: "hello" }],
+        system: "Original Amp system prompt.",
+      }),
+      "/v1/messages",
+    );
+
+    const prepared = JSON.parse(prepareAnthropicBody(body)) as { system: Array<{ type: string; text: string }> };
+    expect(prepared.system).toHaveLength(3);
+    expect(prepared.system[0]?.text).toContain("x-anthropic-billing-header: cc_version=");
+    expect(prepared.system[1]?.text).toBe("You are Claude Code, Anthropic's official CLI for Claude.");
+    expect(prepared.system[2]?.text).toBe("Original Amp system prompt.");
+  });
+
+  test("dedupes existing billing header and Claude Code identity blocks", () => {
+    const body = parseBody(
+      JSON.stringify({
+        max_tokens: 4096,
+        messages: [{ role: "user", content: "hi" }],
+        system: [
+          { type: "text", text: "x-anthropic-billing-header: cc_version=stale; cc_entrypoint=cli; cch=00000;" },
+          { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." },
+          { type: "text", text: "Real system content." },
+        ],
+      }),
+      "/v1/messages",
+    );
+
+    const prepared = JSON.parse(prepareAnthropicBody(body)) as { system: Array<{ type: string; text: string }> };
+    expect(prepared.system).toHaveLength(3);
+    expect(prepared.system[0]?.text).toMatch(/^x-anthropic-billing-header: cc_version=\d+\.\d+\.\d+\.[0-9a-f]{3};/);
+    expect(prepared.system[0]?.text).not.toContain("stale");
+    expect(prepared.system[1]?.text).toBe("You are Claude Code, Anthropic's official CLI for Claude.");
+    expect(prepared.system[2]?.text).toBe("Real system content.");
+  });
+
+  test("populates metadata.user_id when supplied", () => {
+    const body = parseBody(
+      JSON.stringify({
+        max_tokens: 4096,
+        messages: [{ role: "user", content: "hi" }],
+      }),
+      "/v1/messages",
+    );
+
+    const prepared = JSON.parse(prepareAnthropicBody(body, "abc123")) as { metadata?: { user_id?: string } };
+    expect(prepared.metadata?.user_id).toBe("abc123");
+  });
+
+  test("preserves caller-provided metadata.user_id over derived one", () => {
+    const body = parseBody(
+      JSON.stringify({
+        max_tokens: 4096,
+        messages: [{ role: "user", content: "hi" }],
+        metadata: { user_id: "amp-supplied" },
+      }),
+      "/v1/messages",
+    );
+
+    const prepared = JSON.parse(prepareAnthropicBody(body, "derived")) as { metadata?: { user_id?: string } };
+    expect(prepared.metadata?.user_id).toBe("amp-supplied");
+  });
 });
 
 describe("bufferResponseJson", () => {

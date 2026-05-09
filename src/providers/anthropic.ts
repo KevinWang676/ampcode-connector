@@ -37,7 +37,8 @@ export const provider: Provider = {
     const accessToken = await oauth.token(config, account);
     if (!accessToken) return denied("Anthropic");
 
-    const fwdBody = prepareBody(body);
+    const credentials = store.get("anthropic", account);
+    const fwdBody = prepareBody(body, claudeCodeUserId(credentials));
     const betaHdr = betaHeader(originalHeaders.get("anthropic-beta"));
     const clientHeaders = passthroughHeaders(originalHeaders);
 
@@ -47,7 +48,7 @@ export const provider: Provider = {
       streaming: body.stream,
       providerName: "Anthropic",
       rewrite,
-      email: store.get("anthropic", account)?.email,
+      email: credentials?.email,
       headers: {
         // Client headers first (stainless, accept, content-type, anthropic-version, etc.)
         ...clientHeaders,
@@ -63,11 +64,24 @@ export const provider: Provider = {
 };
 
 const BILLING_SALT = "59cf53e54c78";
+const CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
 
-/** Compute the cch checksum from the first user message text and version. */
-function computeCch(firstUserText: string, version: string): string {
+/** Compute the 3-char version integrity hash from sampled user-message chars + version. */
+function computeVersionHash(firstUserText: string, version: string): string {
   const chars = [4, 7, 20].map((i) => firstUserText[i] || "0").join("");
-  return createHash("sha256").update(`${BILLING_SALT}${chars}${version}`).digest("hex").slice(0, 5);
+  return createHash("sha256").update(`${BILLING_SALT}${chars}${version}`).digest("hex").slice(0, 3);
+}
+
+/** Compute the cch — first 5 hex chars of SHA-256(first user message text). */
+function computeCch(firstUserText: string): string {
+  return createHash("sha256").update(firstUserText).digest("hex").slice(0, 5);
+}
+
+/** Stable Claude Code-style metadata.user_id derived from the OAuth account identity. */
+function claudeCodeUserId(credentials?: store.Credentials): string | undefined {
+  const stable = credentials?.accountId ?? credentials?.email;
+  if (!stable) return undefined;
+  return createHash("sha256").update(`anthropic:${stable}`).digest("hex");
 }
 
 /** Extract text from the first user message in the body. */
@@ -86,10 +100,12 @@ function firstUserText(parsed: Record<string, unknown>): string {
   return "";
 }
 
-/** Prepare body: inject billing header + strip speed field.
- *  Always re-injects billing header because cch depends on per-request message content.
+/** Prepare body for Anthropic Max-subscription billing.
+ *  Always re-injects the billing header (cch depends on per-request user message)
+ *  and prepends the Claude Code identity so api.anthropic.com classifies the
+ *  request as Claude Code traffic instead of falling back to API-credit billing.
  *  Shallow-copies parsed to avoid mutating the shared ParsedBody.parsed reference. */
-export function prepareBody(body: ParsedBody): string {
+export function prepareBody(body: ParsedBody, userId?: string): string {
   const raw = body.forwardBody;
 
   try {
@@ -97,13 +113,16 @@ export function prepareBody(body: ParsedBody): string {
     if (!original) return raw;
 
     const text = firstUserText(original);
-    const cch = computeCch(text, CLAUDE_CODE_VERSION);
-    const billingLine = `x-anthropic-billing-header: cc_version=${CLAUDE_CODE_VERSION}; cc_entrypoint=cli; cch=${cch};`;
+    const versionHash = computeVersionHash(text, CLAUDE_CODE_VERSION);
+    const cch = computeCch(text);
+    const billingLine = `x-anthropic-billing-header: cc_version=${CLAUDE_CODE_VERSION}.${versionHash}; cc_entrypoint=cli; cch=${cch};`;
 
-    const { speed: _, system: existingSystem, ...rest } = original;
+    const { speed: _, system: existingSystem, metadata: existingMetadata, ...rest } = original;
+    const metadata = withClaudeCodeMetadata(existingMetadata, userId);
     const prepared = {
       ...rest,
-      system: injectBillingHeader(existingSystem, billingLine),
+      ...(metadata ? { metadata } : {}),
+      system: injectClaudeCodeSystem(existingSystem, billingLine),
     };
 
     stripThinkingIfToolChoiceForced(prepared);
@@ -114,7 +133,6 @@ export function prepareBody(body: ParsedBody): string {
   }
 }
 
-/** Prepend the billing header into the system prompt, handling both array and string formats. */
 function stripThinkingIfToolChoiceForced(body: Record<string, unknown>): void {
   const toolChoice = body.tool_choice as Record<string, unknown> | undefined;
   const type = toolChoice?.type;
@@ -123,17 +141,48 @@ function stripThinkingIfToolChoiceForced(body: Record<string, unknown>): void {
   }
 }
 
-function injectBillingHeader(system: unknown, billingLine: string): unknown {
+function withClaudeCodeMetadata(metadata: unknown, userId?: string): Record<string, unknown> | undefined {
+  const existing =
+    metadata && typeof metadata === "object" && !Array.isArray(metadata)
+      ? { ...(metadata as Record<string, unknown>) }
+      : {};
+  if (!existing.user_id && userId) existing.user_id = userId;
+  return Object.keys(existing).length ? existing : undefined;
+}
+
+function isClaudeCodeAttributionBlock(block: unknown): boolean {
+  const text = (block as { text?: unknown })?.text;
+  return (
+    typeof text === "string" && (text.includes("x-anthropic-billing-header") || text.includes(CLAUDE_CODE_IDENTITY))
+  );
+}
+
+function stripClaudeCodeAttribution(text: string): string {
+  return text
+    .replace(/x-anthropic-billing-header:[^\n]*\n?/g, "")
+    .replaceAll(CLAUDE_CODE_IDENTITY, "")
+    .trim();
+}
+
+/** Prepend `[billing header, Claude Code identity]` to the system blocks.
+ *  The billing header MUST be the first system entry (no cache_control) and the
+ *  identity MUST follow immediately for api.anthropic.com to bill against the
+ *  Max subscription instead of API credits. */
+function injectClaudeCodeSystem(system: unknown, billingLine: string): unknown {
+  const prefix = [
+    { type: "text", text: billingLine },
+    { type: "text", text: CLAUDE_CODE_IDENTITY },
+  ];
+
   if (Array.isArray(system)) {
-    const filtered = system.filter(
-      (s: { text?: string }) => !(typeof s.text === "string" && s.text.includes("x-anthropic-billing-header")),
-    );
-    return [{ type: "text", text: billingLine }, ...filtered];
+    const filtered = system.filter((s) => !isClaudeCodeAttributionBlock(s));
+    return [...prefix, ...filtered];
   }
   if (typeof system === "string") {
-    return `${billingLine}\n${system.replace(/x-anthropic-billing-header:[^\n]*\n?/, "")}`;
+    const cleaned = stripClaudeCodeAttribution(system);
+    return cleaned ? [...prefix, { type: "text", text: cleaned }] : prefix;
   }
-  return [{ type: "text", text: billingLine }];
+  return prefix;
 }
 
 function betaHeader(original: string | null): string {
