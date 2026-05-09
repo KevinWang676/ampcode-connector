@@ -457,6 +457,50 @@ describe("prepareAnthropicBody", () => {
     const prepared = JSON.parse(prepareAnthropicBody(body, "derived")) as { metadata?: { user_id?: string } };
     expect(prepared.metadata?.user_id).toBe("amp-supplied");
   });
+
+  test("does not mutate cached body.parsed when rewriting tool names", () => {
+    const body = parseBody(
+      JSON.stringify({
+        max_tokens: 4096,
+        messages: [
+          {
+            role: "assistant",
+            content: [{ type: "tool_use", id: "toolu_1", name: "oracle", input: {} }],
+          },
+          {
+            role: "user",
+            content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "ok" }],
+          },
+        ],
+        tools: [{ name: "oracle", input_schema: { type: "object" } }],
+        tool_choice: { type: "tool", name: "oracle" },
+      }),
+      "/v1/messages",
+    );
+
+    const prepared = JSON.parse(prepareAnthropicBody(body)) as {
+      tools: Array<{ name: string }>;
+      tool_choice: { name: string };
+      messages: Array<{ content: Array<{ name?: string }> }>;
+    };
+
+    // Outbound body sent to Anthropic must use the MCP-prefixed names.
+    expect(prepared.tools[0]?.name).toBe("mcp__amp__oracle");
+    expect(prepared.tool_choice.name).toBe("mcp__amp__oracle");
+    expect(prepared.messages[0]?.content[0]?.name).toBe("mcp__amp__oracle");
+
+    // Cached body.parsed must remain pristine so reroute/retry passes operate on
+    // the original Amp-shaped names, and so amp's request graph isn't observably
+    // altered by the connector.
+    const cached = body.parsed as {
+      tools: Array<{ name: string }>;
+      tool_choice: { name: string };
+      messages: Array<{ content: Array<{ name?: string }> }>;
+    };
+    expect(cached.tools[0]?.name).toBe("oracle");
+    expect(cached.tool_choice.name).toBe("oracle");
+    expect(cached.messages[0]?.content[0]?.name).toBe("oracle");
+  });
 });
 
 describe("bufferResponseJson", () => {

@@ -105,12 +105,13 @@ function firstUserText(parsed: Record<string, unknown>): string {
  *  Always re-injects the billing header (cch depends on per-request user message)
  *  and prepends the Claude Code identity so api.anthropic.com classifies the
  *  request as Claude Code traffic instead of falling back to API-credit billing.
- *  Shallow-copies parsed to avoid mutating the shared ParsedBody.parsed reference. */
+ *  Re-parses from body.forwardBody to get a fresh deep copy so the in-place tool
+ *  name rewrite never leaks back into the cached ParsedBody.parsed across retries. */
 export function prepareBody(body: ParsedBody, userId?: string): string {
   const raw = body.forwardBody;
 
   try {
-    const original = body.parsed;
+    const original = JSON.parse(raw) as Record<string, unknown> | null;
     if (!original) return raw;
 
     const text = firstUserText(original);
