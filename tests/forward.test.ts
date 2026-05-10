@@ -503,6 +503,177 @@ describe("prepareAnthropicBody", () => {
   });
 });
 
+describe("prepareAnthropicBody — thinking block stripping (fixes Librarian 'Invalid signature in thinking block' 400)", () => {
+  test("removes thinking blocks from assistant messages in history", () => {
+    const body = parseBody(
+      JSON.stringify({
+        max_tokens: 4096,
+        messages: [
+          { role: "user", content: "what's in /etc/hosts?" },
+          {
+            role: "assistant",
+            content: [
+              {
+                type: "thinking",
+                thinking: "I should read the file first",
+                signature: "EuYBCkQYAiJBfh7XQ8a4...VALID_LOOKING_SIG_FROM_PRIOR_TURN...",
+              },
+              { type: "text", text: "Let me read the file." },
+              { type: "tool_use", id: "toolu_1", name: "Read", input: { path: "/etc/hosts" } },
+            ],
+          },
+          {
+            role: "user",
+            content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "127.0.0.1 localhost" }],
+          },
+        ],
+      }),
+      "/v1/messages",
+    );
+
+    const prepared = JSON.parse(prepareAnthropicBody(body)) as {
+      messages: Array<{ role: string; content: Array<{ type: string }> }>;
+    };
+
+    // The assistant turn must no longer contain a thinking block — its
+    // signature would no longer validate against the new system prompt
+    // injected by prepareBody (cch hash + Claude Code identity).
+    const assistant = prepared.messages[1]!;
+    expect(assistant.role).toBe("assistant");
+    const types = assistant.content.map((b) => b.type);
+    expect(types).not.toContain("thinking");
+    // Tool_use and text are preserved exactly.
+    expect(types).toContain("text");
+    expect(types).toContain("tool_use");
+  });
+
+  test("removes redacted_thinking blocks (Anthropic's masked variant) from messages", () => {
+    const body = parseBody(
+      JSON.stringify({
+        max_tokens: 4096,
+        messages: [
+          { role: "user", content: "go" },
+          {
+            role: "assistant",
+            content: [
+              { type: "redacted_thinking", data: "encrypted-bytes" },
+              { type: "text", text: "Doing it." },
+            ],
+          },
+        ],
+      }),
+      "/v1/messages",
+    );
+    const prepared = JSON.parse(prepareAnthropicBody(body)) as {
+      messages: Array<{ content: Array<{ type: string }> }>;
+    };
+    const types = prepared.messages[1]!.content.map((b) => b.type);
+    expect(types).not.toContain("redacted_thinking");
+    expect(types).toContain("text");
+  });
+
+  test("messages without thinking blocks pass through unchanged in shape", () => {
+    const body = parseBody(
+      JSON.stringify({
+        max_tokens: 4096,
+        messages: [
+          { role: "user", content: "hi" },
+          {
+            role: "assistant",
+            content: [{ type: "text", text: "hello" }],
+          },
+        ],
+      }),
+      "/v1/messages",
+    );
+    const prepared = JSON.parse(prepareAnthropicBody(body)) as {
+      messages: Array<{ content: Array<{ type: string; text?: string }> }>;
+    };
+    expect(prepared.messages[1]!.content).toEqual([{ type: "text", text: "hello" }]);
+  });
+
+  test("empty content arrays survive (no crash, no spurious mutation)", () => {
+    const body = parseBody(
+      JSON.stringify({
+        max_tokens: 4096,
+        messages: [
+          { role: "user", content: "go" },
+          { role: "assistant", content: [] },
+        ],
+      }),
+      "/v1/messages",
+    );
+    const prepared = JSON.parse(prepareAnthropicBody(body)) as {
+      messages: Array<{ content: unknown }>;
+    };
+    expect(prepared.messages[1]!.content).toEqual([]);
+  });
+
+  test("string-content messages (no array) pass through untouched", () => {
+    const body = parseBody(
+      JSON.stringify({
+        max_tokens: 4096,
+        messages: [
+          { role: "user", content: "hi" },
+          { role: "assistant", content: "answer" },
+        ],
+      }),
+      "/v1/messages",
+    );
+    const prepared = JSON.parse(prepareAnthropicBody(body)) as {
+      messages: Array<{ role: string; content: unknown }>;
+    };
+    expect(prepared.messages[1]!.content).toBe("answer");
+  });
+
+  test("multi-turn history with thinking on every assistant turn — all stripped, tool_use chain intact", () => {
+    const body = parseBody(
+      JSON.stringify({
+        max_tokens: 4096,
+        messages: [
+          { role: "user", content: "find foo" },
+          {
+            role: "assistant",
+            content: [
+              { type: "thinking", thinking: "search...", signature: "sig-1" },
+              { type: "tool_use", id: "tu-1", name: "Grep", input: { pattern: "foo" } },
+            ],
+          },
+          {
+            role: "user",
+            content: [{ type: "tool_result", tool_use_id: "tu-1", content: "match in a.ts" }],
+          },
+          {
+            role: "assistant",
+            content: [
+              { type: "thinking", thinking: "now read it", signature: "sig-2" },
+              { type: "tool_use", id: "tu-2", name: "Read", input: { path: "a.ts" } },
+            ],
+          },
+          {
+            role: "user",
+            content: [{ type: "tool_result", tool_use_id: "tu-2", content: "..." }],
+          },
+        ],
+      }),
+      "/v1/messages",
+    );
+    const prepared = JSON.parse(prepareAnthropicBody(body)) as {
+      messages: Array<{ role: string; content: Array<{ type: string; id?: string }> }>;
+    };
+    // Every assistant turn must have its thinking stripped.
+    const assistant1 = prepared.messages[1]!;
+    expect(assistant1.content.map((b) => b.type)).toEqual(["tool_use"]);
+    expect(assistant1.content[0]?.id).toBe("tu-1");
+    const assistant2 = prepared.messages[3]!;
+    expect(assistant2.content.map((b) => b.type)).toEqual(["tool_use"]);
+    expect(assistant2.content[0]?.id).toBe("tu-2");
+    // Tool_result user turns are untouched.
+    expect((prepared.messages[2]!.content[0] as { type: string }).type).toBe("tool_result");
+    expect((prepared.messages[4]!.content[0] as { type: string }).type).toBe("tool_result");
+  });
+});
+
 describe("bufferResponseJson", () => {
   test("synthesizes handoff message output while buffering Codex SSE", async () => {
     const response = new Response(

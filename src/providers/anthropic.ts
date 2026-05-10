@@ -129,11 +129,62 @@ export function prepareBody(body: ParsedBody, userId?: string): string {
     };
 
     rewriteAnthropicRequestToolNames(prepared);
+    stripThinkingBlocksFromMessages(prepared);
     stripThinkingIfToolChoiceForced(prepared);
 
     return JSON.stringify(prepared);
   } catch {
     return raw;
+  }
+}
+
+/** Remove `thinking` and `redacted_thinking` content blocks from every
+ *  message in the request history before forwarding to Anthropic.
+ *
+ *  Why: Anthropic's extended-thinking signature is bound to the conversation
+ *  context that produced it (model, system prompt, prior content). The
+ *  connector's prepareBody re-injects the Claude Code identity AND the
+ *  per-request `cch=<hash(latest_user_message)>` billing line into the
+ *  `system` field, which means the effective system prompt changes between
+ *  turns. As soon as the request arrives at Anthropic with a thinking block
+ *  whose signature was issued under a different system context, the API
+ *  rejects with:
+ *
+ *    messages.N.content.M: Invalid `signature` in `thinking` block
+ *
+ *  This is the failure mode the Librarian subagent and any other
+ *  multi-turn extended-thinking flow hits when routed through the
+ *  connector. Single-turn flows (e.g. Oracle in its common usage)
+ *  do not exercise the validation path because they never echo a
+ *  prior thinking block back.
+ *
+ *  The local Neo inference path (anthropicMessages in
+ *  src/server/neo-local-inference.ts) already strips thinking blocks
+ *  from `LocalHistoryMessage[]` for the same reason — only `text` and
+ *  `tool_use` blocks are emitted into the assistant turn. This helper
+ *  brings the proxy/forward path to the same level of safety, so both
+ *  routes have identical, deterministic message-shape semantics.
+ *
+ *  Functional impact: the model loses access to its prior chain-of-thought
+ *  text on subsequent turns. This is the same trade-off the local Neo
+ *  path has been making since extended-thinking support was added; the
+ *  model still reasons fresh on each turn (visible via the
+ *  `thinking` REQUEST config, when present), so output quality is
+ *  unaffected. Cross-platform pure-logic transform — no env coupling. */
+function stripThinkingBlocksFromMessages(body: Record<string, unknown>): void {
+  const messages = body.messages;
+  if (!Array.isArray(messages)) return;
+  for (const message of messages) {
+    if (!message || typeof message !== "object" || Array.isArray(message)) continue;
+    const msg = message as Record<string, unknown>;
+    const content = msg.content;
+    if (!Array.isArray(content)) continue;
+    const filtered = content.filter((block) => {
+      if (!block || typeof block !== "object" || Array.isArray(block)) return true;
+      const t = (block as Record<string, unknown>).type;
+      return t !== "thinking" && t !== "redacted_thinking";
+    });
+    if (filtered.length !== content.length) msg.content = filtered;
   }
 }
 
