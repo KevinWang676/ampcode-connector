@@ -558,6 +558,132 @@ describe("Neo history repair (orphan tool_use)", () => {
     expect(messages[3]?.role).toBe("tool");
     expect((messages[3] as Record<string, unknown>)?.tool_call_id).toBe("call-orphan");
   });
+
+  test("Anthropic: multi-tool_use assistant with results split across consecutive user messages is coalesced into one user message with no duplicates", () => {
+    const messages = anthropicMessages([
+      { role: "user", text: "hi" },
+      {
+        role: "assistant",
+        text: "running two tools",
+        toolCalls: [
+          { id: "TU-multi-A", name: "Bash", input: { cmd: "a" } },
+          { id: "TU-multi-B", name: "Bash", input: { cmd: "b" } },
+        ],
+      },
+      { role: "tool", toolCallId: "TU-multi-A", text: "result A" },
+      { role: "tool", toolCallId: "TU-multi-B", text: "result B" },
+    ]);
+    // Expected after repair:
+    //   [0] user(text "hi")
+    //   [1] assistant(tool_use TU-multi-A, TU-multi-B)
+    //   [2] user(tool_result TU-multi-A, tool_result TU-multi-B)  <-- coalesced
+    expect(messages.length).toBe(3);
+    expect(messages[1]?.role).toBe("assistant");
+    expect(messages[2]?.role).toBe("user");
+    const merged = messages[2]?.content as Array<Record<string, unknown>>;
+    expect(merged?.length).toBe(2);
+    expect(merged?.[0]?.type).toBe("tool_result");
+    expect(merged?.[0]?.tool_use_id).toBe("TU-multi-A");
+    expect(merged?.[0]?.is_error).toBeUndefined();
+    expect(merged?.[1]?.type).toBe("tool_result");
+    expect(merged?.[1]?.tool_use_id).toBe("TU-multi-B");
+    expect(merged?.[1]?.is_error).toBeUndefined();
+  });
+
+  test("Anthropic: only some tool_results present across split user messages — synthesizes ONE stub for the missing id and does not duplicate the present one", () => {
+    // This is the exact failure mode from the user-reported 400:
+    //   "messages.N.content.M: each tool_use must have a single result.
+    //    Found multiple `tool_result` blocks with id: TU-..."
+    // Pre-fix: the repair only inspected messages[i+1] and synthesized a stub
+    // for TU-A even though TU-A was present in messages[i+2].
+    const messages = anthropicMessages([
+      { role: "user", text: "hi" },
+      {
+        role: "assistant",
+        text: "two tools",
+        toolCalls: [
+          { id: "TU-present", name: "Bash", input: {} },
+          { id: "TU-missing", name: "Grep", input: {} },
+        ],
+      },
+      // Real tool_result for TU-present sits in the SECOND user message of the
+      // run, after a different one. (Order from history matters here.)
+      { role: "tool", toolCallId: "TU-present", text: "ok" },
+      // Note: NO tool_result for TU-missing — represents a cancelled tool.
+    ]);
+    // Expected: one coalesced user message holding the real tool_result for
+    // TU-present plus a synthesized is_error stub for TU-missing. No duplicates.
+    expect(messages.length).toBe(3);
+    const merged = messages[2]?.content as Array<Record<string, unknown>>;
+    expect(merged?.length).toBe(2);
+    const idsSeen = merged.map((b) => b.tool_use_id);
+    expect(idsSeen).toContain("TU-present");
+    expect(idsSeen).toContain("TU-missing");
+    // No duplicate ids.
+    expect(new Set(idsSeen).size).toBe(idsSeen.length);
+    const present = merged.find((b) => b.tool_use_id === "TU-present");
+    expect(present?.is_error).toBeUndefined();
+    const missing = merged.find((b) => b.tool_use_id === "TU-missing");
+    expect(missing?.is_error).toBe(true);
+  });
+
+  test("Anthropic: pre-existing duplicate tool_result blocks (same id) are deduped (first wins)", () => {
+    // Simulate a corrupted history where the actor appended TU-dup twice.
+    const messages = anthropicMessages([
+      { role: "user", text: "hi" },
+      { role: "assistant", text: "one tool", toolCalls: [{ id: "TU-dup", name: "Bash", input: {} }] },
+      { role: "tool", toolCallId: "TU-dup", text: "first result" },
+      { role: "tool", toolCallId: "TU-dup", text: "second (duplicate) result" },
+    ]);
+    expect(messages.length).toBe(3);
+    const merged = messages[2]?.content as Array<Record<string, unknown>>;
+    expect(merged?.length).toBe(1);
+    expect(merged?.[0]?.tool_use_id).toBe("TU-dup");
+    // First-occurrence-wins.
+    expect(merged?.[0]?.content).toBe("first result");
+  });
+
+  test("Anthropic: tool_result run followed by trailing user text — text user message is preserved separately", () => {
+    const messages = anthropicMessages([
+      { role: "user", text: "hi" },
+      { role: "assistant", text: "", toolCalls: [{ id: "TU-mix", name: "Bash", input: {} }] },
+      { role: "tool", toolCallId: "TU-mix", text: "tool out" },
+      { role: "user", text: "next prompt" },
+    ]);
+    // Expected:
+    //   [0] user(text "hi")
+    //   [1] assistant(tool_use)
+    //   [2] user(tool_result TU-mix)
+    //   [3] user(text "next prompt")
+    expect(messages.length).toBe(4);
+    expect(messages[2]?.role).toBe("user");
+    const tr = messages[2]?.content as Array<Record<string, unknown>>;
+    expect(tr?.[0]?.type).toBe("tool_result");
+    expect(tr?.[0]?.tool_use_id).toBe("TU-mix");
+    expect(messages[3]?.role).toBe("user");
+    const txt = messages[3]?.content as Array<Record<string, unknown>>;
+    expect(txt?.[0]?.type).toBe("text");
+    expect(txt?.[0]?.text).toBe("next prompt");
+  });
+
+  test("OpenAI: pre-existing duplicate tool messages (same tool_call_id) are deduped", () => {
+    // Build a history that produces a duplicate tool message in the wire format.
+    // openAIMessages emits one role:"tool" message per history entry of role "tool".
+    const messages = openAIMessages(
+      [
+        { role: "user", text: "hi" },
+        { role: "assistant", text: "", toolCalls: [{ id: "call-dup", name: "Bash", input: {} }] },
+        { role: "tool", toolCallId: "call-dup", text: "first result" },
+        { role: "tool", toolCallId: "call-dup", text: "duplicate result" },
+      ],
+      "system",
+    );
+    // [system, user, assistant, tool] — duplicate dropped.
+    expect(messages.length).toBe(4);
+    expect(messages[3]?.role).toBe("tool");
+    expect((messages[3] as Record<string, unknown>)?.tool_call_id).toBe("call-dup");
+    expect((messages[3] as Record<string, unknown>)?.content).toBe("first result");
+  });
 });
 
 describe("Neo Anthropic SSE parser", () => {

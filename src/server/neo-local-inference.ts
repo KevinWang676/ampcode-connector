@@ -896,21 +896,52 @@ function ensureAnthropicToolResults(messages: JsonRecord[]): JsonRecord[] {
     }
     if (expectedIds.length === 0) continue;
 
-    const next = messages[i + 1];
-    const nextIsUser = next && next.role === "user" && Array.isArray(next.content);
-    const nextContent = nextIsUser ? (next.content as JsonRecord[]) : [];
-    const presentIds = new Set<string>();
-    for (const block of nextContent) {
-      const item = jsonRecord(block);
-      if (item.type === "tool_result" && typeof item.tool_use_id === "string") presentIds.add(item.tool_use_id);
+    // Scan ALL consecutive user messages following this assistant turn — not
+    // just messages[i+1]. anthropicMessages() emits one user message per tool
+    // history entry, and the Anthropic validator merges consecutive same-role
+    // messages during validation. If we only inspected i+1 we would synthesize
+    // a stub for an id that is actually present in i+2 / i+3 / …, producing
+    // duplicate tool_result blocks and a 400 "each tool_use must have a single
+    // result" error.
+    let userRunEnd = i + 1;
+    while (userRunEnd < messages.length && messages[userRunEnd]!.role === "user") {
+      userRunEnd++;
     }
 
-    const missing = expectedIds.filter((id) => !presentIds.has(id));
-    if (missing.length === 0) continue;
+    // Walk the user run: extract tool_result blocks (deduped by tool_use_id,
+    // first occurrence wins) into a single bucket; preserve any non-tool_result
+    // content (text, images, etc.) in its original message ordering.
+    const seenToolIds = new Set<string>();
+    const dedupedToolResults: JsonRecord[] = [];
+    let duplicatesRemoved = 0;
+    const leftoverMessages: JsonRecord[] = [];
+    for (let j = i + 1; j < userRunEnd; j++) {
+      const userMsg = messages[j]!;
+      const userContent = Array.isArray(userMsg.content) ? (userMsg.content as JsonRecord[]) : [];
+      const leftover: JsonRecord[] = [];
+      for (const block of userContent) {
+        const item = jsonRecord(block);
+        if (item.type === "tool_result" && typeof item.tool_use_id === "string") {
+          if (seenToolIds.has(item.tool_use_id)) {
+            duplicatesRemoved++;
+            continue;
+          }
+          seenToolIds.add(item.tool_use_id);
+          dedupedToolResults.push(item);
+        } else {
+          leftover.push(item);
+        }
+      }
+      if (leftover.length > 0) leftoverMessages.push({ role: "user", content: leftover });
+    }
 
-    logger.warn(
-      `Anthropic history repair: synthesizing tool_result for ${missing.length} orphan tool_use id(s) at message index ${i} (likely from a cancelled or interrupted prior turn)`,
-    );
+    if (duplicatesRemoved > 0) {
+      logger.warn(
+        `Anthropic history repair: removed ${duplicatesRemoved} duplicate tool_result block(s) for assistant turn at message index ${i}`,
+      );
+    }
+
+    const missing = expectedIds.filter((id) => !seenToolIds.has(id));
     const synthesized: JsonRecord[] = missing.map((id) => ({
       type: "tool_result",
       tool_use_id: id,
@@ -918,12 +949,29 @@ function ensureAnthropicToolResults(messages: JsonRecord[]): JsonRecord[] {
       is_error: true,
     }));
 
-    // Always insert a fresh user message immediately after the assistant turn
-    // so the tool_result sits in its own dedicated message — keeps the
-    // structure unambiguous and survives any future stricter API validation.
-    messages.splice(i + 1, 0, { role: "user", content: synthesized });
-    // The synthesized message now sits at i+1; the loop will skip past it on
-    // the next iteration since assistant role check fails.
+    if (synthesized.length > 0) {
+      logger.warn(
+        `Anthropic history repair: synthesizing tool_result for ${synthesized.length} orphan tool_use id(s) at message index ${i} (likely from a cancelled or interrupted prior turn)`,
+      );
+    }
+
+    const allToolResults = [...dedupedToolResults, ...synthesized];
+    const replacement: JsonRecord[] = [];
+    if (allToolResults.length > 0) {
+      replacement.push({ role: "user", content: allToolResults });
+    }
+    replacement.push(...leftoverMessages);
+
+    // Replace the entire user run with the canonicalized form. If the user run
+    // was empty (assistant was last) and we only synthesized stubs, this still
+    // inserts the stub message correctly because removedCount is 0.
+    const removedCount = userRunEnd - (i + 1);
+    if (removedCount === 0 && replacement.length === 0) continue;
+    messages.splice(i + 1, removedCount, ...replacement);
+    // Skip past the messages we just rewrote — none of them are assistant
+    // messages, so the i++ from the for loop will land us correctly on the
+    // next assistant (if any).
+    i += replacement.length;
   }
   return messages;
 }
@@ -966,14 +1014,32 @@ function ensureOpenAIToolResponses(messages: JsonRecord[]): JsonRecord[] {
     const expectedIds = calls.map((c) => (typeof c.id === "string" ? c.id : "")).filter(Boolean);
     if (expectedIds.length === 0) continue;
 
-    const presentIds = new Set<string>();
+    // Scan and dedupe consecutive role:"tool" messages. If the same
+    // tool_call_id appears twice (cloud-sync replay, persisted-state
+    // corruption, etc.), drop the later occurrence so the Codex backend
+    // does not see two responses for one tool_call.
+    const seenIds = new Set<string>();
+    let duplicatesRemoved = 0;
     let scan = i + 1;
     while (scan < messages.length && messages[scan]?.role === "tool") {
       const id = messages[scan]?.tool_call_id;
-      if (typeof id === "string") presentIds.add(id);
+      if (typeof id === "string") {
+        if (seenIds.has(id)) {
+          messages.splice(scan, 1);
+          duplicatesRemoved++;
+          continue;
+        }
+        seenIds.add(id);
+      }
       scan++;
     }
-    const missing = expectedIds.filter((id) => !presentIds.has(id));
+    if (duplicatesRemoved > 0) {
+      logger.warn(
+        `OpenAI history repair: removed ${duplicatesRemoved} duplicate tool message(s) for assistant turn at message index ${i}`,
+      );
+    }
+
+    const missing = expectedIds.filter((id) => !seenIds.has(id));
     if (missing.length === 0) continue;
 
     logger.warn(
@@ -984,8 +1050,10 @@ function ensureOpenAIToolResponses(messages: JsonRecord[]): JsonRecord[] {
       tool_call_id: id,
       content: "Tool execution did not complete in this session (cancelled, interrupted, or truncated).",
     }));
-    messages.splice(i + 1, 0, ...synthesized);
-    i += synthesized.length;
+    // Insert at the END of the existing tool sequence (scan), preserving the
+    // order of any real tool responses already present.
+    messages.splice(scan, 0, ...synthesized);
+    i = scan + synthesized.length - 1;
   }
   return messages;
 }
