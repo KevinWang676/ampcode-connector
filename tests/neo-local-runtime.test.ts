@@ -7,8 +7,10 @@ import { LocalThreadActor, localFindThreadRun, localReadThreadRun } from "../src
 import { clampReasoningEffort } from "../src/providers/codex.ts";
 import {
   anthropicMaxOutputTokens,
+  anthropicMessages,
   anthropicThinking,
   googleMaxOutputTokens,
+  openAIMessages,
   openAIReasoningEffort,
   parseAnthropicSse,
   parseOpenAISse,
@@ -485,6 +487,76 @@ describe("Neo OpenAI reasoning effort", () => {
     expect(clampReasoningEffort("gpt-5.3", "minimal")).toBe("low");
     expect(clampReasoningEffort("gpt-5.1-codex-mini", "low")).toBe("medium");
     expect(clampReasoningEffort("gpt-5.1-codex-mini", "high")).toBe("high");
+  });
+});
+
+describe("Neo history repair (orphan tool_use)", () => {
+  test("synthesizes tool_result when assistant tool_use is followed by a plain user text turn", () => {
+    const messages = anthropicMessages([
+      { role: "user", text: "first user msg" },
+      { role: "assistant", text: "ok let me search", toolCalls: [{ id: "TU-orphan-1", name: "Grep", input: { pattern: "x" } }] },
+      // Note: NO {role: "tool", toolCallId: "TU-orphan-1"} here — corrupted history.
+      { role: "user", text: "second user msg after orphan" },
+    ]);
+
+    // Expected: assistant turn (idx 1) followed by injected synthetic user turn
+    // with tool_result, THEN the original user text.
+    expect(messages[1]?.role).toBe("assistant");
+    const synth = messages[2] as Record<string, unknown>;
+    expect(synth?.role).toBe("user");
+    const synthContent = synth?.content as Array<Record<string, unknown>>;
+    expect(synthContent?.[0]?.type).toBe("tool_result");
+    expect(synthContent?.[0]?.tool_use_id).toBe("TU-orphan-1");
+    expect(synthContent?.[0]?.is_error).toBe(true);
+    // Original user text should still be present afterward.
+    expect(messages[3]?.role).toBe("user");
+    expect((messages[3]?.content as Array<Record<string, unknown>>)?.[0]?.type).toBe("text");
+  });
+
+  test("synthesizes tool_result when assistant tool_use is the final message in history", () => {
+    const messages = anthropicMessages([
+      { role: "user", text: "hi" },
+      { role: "assistant", text: "running", toolCalls: [{ id: "TU-orphan-tail", name: "Bash", input: {} }] },
+      // No follow-up at all.
+    ]);
+    expect(messages.length).toBe(3);
+    const synth = messages[2] as Record<string, unknown>;
+    expect(synth?.role).toBe("user");
+    const synthContent = synth?.content as Array<Record<string, unknown>>;
+    expect(synthContent?.[0]?.type).toBe("tool_result");
+    expect(synthContent?.[0]?.tool_use_id).toBe("TU-orphan-tail");
+  });
+
+  test("leaves well-paired tool_use/tool_result history untouched", () => {
+    const messages = anthropicMessages([
+      { role: "user", text: "hi" },
+      { role: "assistant", text: "", toolCalls: [{ id: "TU-good-1", name: "Read", input: { path: "/a" } }] },
+      { role: "tool", toolCallId: "TU-good-1", text: "file contents" },
+      { role: "assistant", text: "done" },
+    ]);
+    expect(messages.length).toBe(4);
+    expect(messages[1]?.role).toBe("assistant");
+    expect(messages[2]?.role).toBe("user");
+    const okContent = messages[2]?.content as Array<Record<string, unknown>>;
+    expect(okContent?.[0]?.type).toBe("tool_result");
+    expect(okContent?.[0]?.tool_use_id).toBe("TU-good-1");
+    // No is_error on the legitimate tool_result.
+    expect(okContent?.[0]?.is_error).toBeUndefined();
+  });
+
+  test("OpenAI message builder synthesizes a tool stub for orphan tool_calls", () => {
+    const messages = openAIMessages(
+      [
+        { role: "user", text: "hi" },
+        { role: "assistant", text: "", toolCalls: [{ id: "call-orphan", name: "Read", input: {} }] },
+        { role: "user", text: "follow-up" },
+      ],
+      "system",
+    );
+    // [system, user, assistant, synth-tool, user]
+    expect(messages.length).toBe(5);
+    expect(messages[3]?.role).toBe("tool");
+    expect((messages[3] as Record<string, unknown>)?.tool_call_id).toBe("call-orphan");
   });
 });
 

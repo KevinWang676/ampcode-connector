@@ -849,7 +849,7 @@ function systemPrompt(request: LocalInferenceRequest): string {
     .join("\n");
 }
 
-function anthropicMessages(history: LocalHistoryMessage[]): JsonRecord[] {
+export function anthropicMessages(history: LocalHistoryMessage[]): JsonRecord[] {
   const messages: JsonRecord[] = [];
   for (const msg of history) {
     if (msg.role === "system") continue;
@@ -871,10 +871,64 @@ function anthropicMessages(history: LocalHistoryMessage[]): JsonRecord[] {
     }
     messages.push({ role: "user", content: [{ type: "text", text: msg.text ?? "" }] });
   }
+  return ensureAnthropicToolResults(messages);
+}
+
+/** Anthropic strictly requires that every `tool_use` block in an assistant
+ *  message be answered by a `tool_result` block (with matching `tool_use_id`)
+ *  in the very next message. Stale persisted threads can break this invariant
+ *  whenever a turn was cancelled, the connector restarted mid-tool, or a tool
+ *  truncation aborted before the CLI returned a result.
+ *
+ *  This pass repairs the message list in-place: for any orphan `tool_use` ids
+ *  in an assistant message, synthesize a placeholder `tool_result` (with
+ *  `is_error: true`) and inject it into the next user message — or insert a
+ *  fresh user message immediately after if none exists. Runs in O(N). */
+function ensureAnthropicToolResults(messages: JsonRecord[]): JsonRecord[] {
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i]!;
+    if (msg.role !== "assistant") continue;
+    const content = Array.isArray(msg.content) ? msg.content : [];
+    const expectedIds: string[] = [];
+    for (const block of content) {
+      const item = jsonRecord(block);
+      if (item.type === "tool_use" && typeof item.id === "string") expectedIds.push(item.id);
+    }
+    if (expectedIds.length === 0) continue;
+
+    const next = messages[i + 1];
+    const nextIsUser = next && next.role === "user" && Array.isArray(next.content);
+    const nextContent = nextIsUser ? (next.content as JsonRecord[]) : [];
+    const presentIds = new Set<string>();
+    for (const block of nextContent) {
+      const item = jsonRecord(block);
+      if (item.type === "tool_result" && typeof item.tool_use_id === "string") presentIds.add(item.tool_use_id);
+    }
+
+    const missing = expectedIds.filter((id) => !presentIds.has(id));
+    if (missing.length === 0) continue;
+
+    logger.warn(
+      `Anthropic history repair: synthesizing tool_result for ${missing.length} orphan tool_use id(s) at message index ${i} (likely from a cancelled or interrupted prior turn)`,
+    );
+    const synthesized: JsonRecord[] = missing.map((id) => ({
+      type: "tool_result",
+      tool_use_id: id,
+      content: "Tool execution did not complete in this session (cancelled, interrupted, or truncated).",
+      is_error: true,
+    }));
+
+    // Always insert a fresh user message immediately after the assistant turn
+    // so the tool_result sits in its own dedicated message — keeps the
+    // structure unambiguous and survives any future stricter API validation.
+    messages.splice(i + 1, 0, { role: "user", content: synthesized });
+    // The synthesized message now sits at i+1; the loop will skip past it on
+    // the next iteration since assistant role check fails.
+  }
   return messages;
 }
 
-function openAIMessages(history: LocalHistoryMessage[], system: string): JsonRecord[] {
+export function openAIMessages(history: LocalHistoryMessage[], system: string): JsonRecord[] {
   const messages: JsonRecord[] = [{ role: "system", content: system }];
   for (const msg of history) {
     if (msg.role === "system") continue;
@@ -895,6 +949,43 @@ function openAIMessages(history: LocalHistoryMessage[], system: string): JsonRec
       continue;
     }
     messages.push({ role: "user", content: msg.text ?? "" });
+  }
+  return ensureOpenAIToolResponses(messages);
+}
+
+/** OpenAI Chat Completions requires a {role:"tool", tool_call_id} message for
+ *  every tool_call emitted by an assistant turn. Cancellation / restart /
+ *  truncation can leave orphan tool_calls. Synthesize stub responses so the
+ *  Codex backend doesn't reject the request. */
+function ensureOpenAIToolResponses(messages: JsonRecord[]): JsonRecord[] {
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i]!;
+    if (msg.role !== "assistant") continue;
+    const calls = Array.isArray(msg.tool_calls) ? (msg.tool_calls as JsonRecord[]) : [];
+    if (calls.length === 0) continue;
+    const expectedIds = calls.map((c) => (typeof c.id === "string" ? c.id : "")).filter(Boolean);
+    if (expectedIds.length === 0) continue;
+
+    const presentIds = new Set<string>();
+    let scan = i + 1;
+    while (scan < messages.length && messages[scan]?.role === "tool") {
+      const id = messages[scan]?.tool_call_id;
+      if (typeof id === "string") presentIds.add(id);
+      scan++;
+    }
+    const missing = expectedIds.filter((id) => !presentIds.has(id));
+    if (missing.length === 0) continue;
+
+    logger.warn(
+      `OpenAI history repair: synthesizing tool response for ${missing.length} orphan tool_call id(s) at message index ${i}`,
+    );
+    const synthesized: JsonRecord[] = missing.map((id) => ({
+      role: "tool",
+      tool_call_id: id,
+      content: "Tool execution did not complete in this session (cancelled, interrupted, or truncated).",
+    }));
+    messages.splice(i + 1, 0, ...synthesized);
+    i += synthesized.length;
   }
   return messages;
 }
