@@ -275,6 +275,91 @@ describe("Neo local cancellation", () => {
   });
 });
 
+describe("LocalThreadActor importCloudThread (used by stale-snapshot refresh on resume)", () => {
+  test("replaces local messages with cloud messages and resets seq counter", () => {
+    const actor = new LocalThreadActor({
+      config: {
+        hostname: "localhost",
+        port: 8765,
+        ampUpstreamUrl: "https://ampcode.com",
+        logLevel: "error",
+        providers: { anthropic: true, codex: true, google: true },
+      },
+      actorId: "actor-import-test-1",
+      threadId: "T-import01-1234-1234-1234-123456789abc",
+    });
+
+    // Pre-seed actor state by calling open() so handlers initialize, then
+    // populate a couple of in-memory messages directly (mimicking a stale
+    // local snapshot from a prior connector session).
+    const sent: unknown[] = [];
+    const ws = { readyState: WebSocket.OPEN, send: (v: string) => sent.push(JSON.parse(v)) };
+    actor.open(ws as never);
+    const internal = actor as unknown as {
+      messages: Array<{ seq: number; role: string }>;
+      seq: number;
+      history: Array<{ role: string }>;
+    };
+    internal.messages = [
+      { seq: 1, role: "user" } as never,
+      { seq: 2, role: "assistant" } as never,
+    ];
+    internal.seq = 3;
+
+    // Cloud has 5 messages — strictly newer than local's 2.
+    actor.importCloudThread({
+      id: "T-import01-1234-1234-1234-123456789abc",
+      title: "Refreshed",
+      messages: [
+        { role: "user", messageId: "M-cloud1", content: [{ type: "text", text: "u1" }] },
+        { role: "assistant", messageId: "M-cloud2", content: [{ type: "text", text: "a1" }] },
+        { role: "user", messageId: "M-cloud3", content: [{ type: "text", text: "u2" }] },
+        { role: "assistant", messageId: "M-cloud4", content: [{ type: "text", text: "a2" }] },
+        { role: "user", messageId: "M-cloud5", content: [{ type: "text", text: "u3" }] },
+      ],
+    });
+
+    const snap = actor.snapshot();
+    expect(snap.messages.length).toBe(5);
+    expect(snap.messages[0]?.messageId).toBe("M-cloud1");
+    expect(snap.messages[4]?.messageId).toBe("M-cloud5");
+    // Seq counter should be at least one past the imported message count so
+    // the next message issued by the actor lands ahead of everything cloud
+    // already has — preventing the "broadcast seq is older than CLI cache"
+    // bug that made fresh prompts disappear in the CLI when switching from
+    // official Neo back to the connector.
+    expect(snap.seq).toBeGreaterThan(5);
+    expect(snap.title).toBe("Refreshed");
+  });
+
+  test("import preserves message order and assigns monotonically increasing seq", () => {
+    const actor = new LocalThreadActor({
+      config: {
+        hostname: "localhost",
+        port: 8765,
+        ampUpstreamUrl: "https://ampcode.com",
+        logLevel: "error",
+        providers: { anthropic: true, codex: true, google: true },
+      },
+      actorId: "actor-import-test-2",
+      threadId: "T-import02-1234-1234-1234-123456789abc",
+    });
+    actor.importCloudThread({
+      id: "T-import02-1234-1234-1234-123456789abc",
+      title: "Ordered",
+      messages: [
+        { role: "user", messageId: "M-a", content: [{ type: "text", text: "a" }] },
+        { role: "user", messageId: "M-b", content: [{ type: "text", text: "b" }] },
+        { role: "user", messageId: "M-c", content: [{ type: "text", text: "c" }] },
+      ],
+    });
+    const snap = actor.snapshot();
+    expect(snap.messages.map((m) => m.messageId)).toEqual(["M-a", "M-b", "M-c"]);
+    const seqs = snap.messages.map((m) => m.seq);
+    for (let i = 1; i < seqs.length; i++) expect(seqs[i]).toBeGreaterThan(seqs[i - 1]!);
+  });
+});
+
 describe("Neo cloud sync shape", () => {
   test("converts persisted Neo snapshots into Amp uploadThread payloads", () => {
     const threadId = "T-12345678-1234-1234-1234-123456789abc";

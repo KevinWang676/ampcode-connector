@@ -401,7 +401,18 @@ class ActorStore {
     const existingId = key ? this.byNameKey.get(this.nameKey(name, key)) : undefined;
     if (reuse && existingId) {
       const existing = this.actors.get(existingId);
-      if (existing) return { ...existing, created: false };
+      if (existing) {
+        // Reuse path: the local snapshot may be stale if the user used another
+        // client (official AMP Neo, web UI, second machine) for this thread
+        // since we last touched it. Pull the latest from cloud and import it
+        // if cloud has progressed beyond our local copy. Without this, the
+        // connector serves a snapshot whose `seq` counter is behind what the
+        // CLI already has cached, so newly-broadcast messages get filtered
+        // out by the CLI as "older than what I already saw" and the prompt
+        // visually disappears.
+        await this.refreshFromCloudIfStale(existing);
+        return { ...existing, created: false };
+      }
     }
 
     const id = newActorId();
@@ -415,6 +426,35 @@ class ActorStore {
     if (cloudThread) actor.importCloudThread(cloudThread);
     this.save(id, name, key, record, actor.snapshot());
     return { ...stored, created: true };
+  }
+
+  /** When reusing an existing local actor, fetch the cloud thread and import
+   *  it iff cloud has more messages than local. Conservative: never overwrites
+   *  local when local has unsynced messages cloud does not yet know about. */
+  private async refreshFromCloudIfStale(stored: StoredActor): Promise<void> {
+    const localSnap = stored.actor.snapshot();
+    const threadId = localSnap.threadId;
+    if (!threadId) return;
+    let cloudThread: JsonRecord | null = null;
+    try {
+      cloudThread = await this.cloudSync.fetchThread(threadId);
+    } catch (err) {
+      logger.warn("Failed to refresh local Neo actor from cloud", {
+        threadId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return;
+    }
+    if (!cloudThread) return;
+    const cloudMessages = Array.isArray(cloudThread.messages) ? cloudThread.messages : [];
+    if (cloudMessages.length <= localSnap.messages.length) return;
+    logger.info("Refreshing local Neo actor from cloud", {
+      threadId,
+      localMessages: localSnap.messages.length,
+      cloudMessages: cloudMessages.length,
+    });
+    stored.actor.importCloudThread(cloudThread);
+    this.save(stored.id, stored.name, stored.key, stored.record, stored.actor.snapshot());
   }
 
   private createActor(
