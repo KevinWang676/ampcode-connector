@@ -62,7 +62,11 @@ function detectCodexCliVersion(): string {
   if (override) return override;
 
   try {
-    const output = execFileSync("codex", ["--version"], { encoding: "utf8", timeout: 2000 }).trim();
+    const output = execFileSync("codex", ["--version"], {
+      encoding: "utf8",
+      timeout: 2000,
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
     const match = output.match(/(\d+\.\d+\.\d+)/);
     if (match) return match[1]!;
   } catch {
