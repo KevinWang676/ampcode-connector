@@ -43,14 +43,97 @@ export function startNeoLocalRuntime(config: ProxyConfig, hostname: string): Ret
       port: DEFAULT_PORT,
       hostname,
       idleTimeout: 255,
-      fetch(req, srv) {
+      async fetch(req, srv) {
         const url = new URL(req.url);
-        if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {
-          const protocols = parseProtocols(req.headers.get("sec-websocket-protocol"));
-          const actorId = extractActorIdFromProtocols(protocols) ?? url.searchParams.get("actorId");
-          if (!actorId || !store.get(actorId)) return new Response("Unknown local Neo actor", { status: 404 });
-          const headers = protocols[0] ? { "Sec-WebSocket-Protocol": protocols[0] } : undefined;
-          return srv.upgrade(req, { data: { actorId }, headers })
+        const upgrade = req.headers.get("upgrade")?.toLowerCase() === "websocket";
+        const protocols = parseProtocols(req.headers.get("sec-websocket-protocol"));
+
+        logger.info(
+          `Neo local runtime request ${JSON.stringify({
+            method: req.method,
+            path: url.pathname,
+            search: redactNeoSearch(url.search),
+            upgrade,
+            protocols: redactProtocols(protocols),
+            host: req.headers.get("host"),
+            xRivetActor: req.headers.get("x-rivet-actor"),
+            xRivetTarget: req.headers.get("x-rivet-target"),
+          })}`,
+        );
+
+        if (upgrade) {
+          // RivetKit gateway path: /gateway/<actorName>/websocket/?rvt-method=getOrCreate&rvt-key=<key>&rvt-input=<json>
+          const gateway = parseGatewayRequest(url, protocols);
+          let resolvedActorId: string | null = null;
+          if (gateway) {
+            try {
+              const stored = await store.upsertFromGateway(gateway);
+              resolvedActorId = stored.id;
+              logger.info(
+                `Neo local runtime gateway resolved ${JSON.stringify({
+                  actorName: gateway.actorName,
+                  method: gateway.method,
+                  key: gateway.key,
+                  actorId: stored.id,
+                  created: stored.created,
+                })}`,
+              );
+            } catch (err) {
+              logger.warn(
+                `Neo local runtime gateway upsert failed ${JSON.stringify({
+                  error: err instanceof Error ? err.message : String(err),
+                  actorName: gateway.actorName,
+                  key: gateway.key,
+                })}`,
+              );
+            }
+          }
+
+          const actorId = resolvedActorId ?? actorIdFromRequest(url, protocols, req);
+
+          logger.info(
+            `Neo local runtime WebSocket upgrade ${JSON.stringify({
+              path: url.pathname,
+              search: redactNeoSearch(url.search),
+              protocols: redactProtocols(protocols),
+              actorId,
+              knownActor: actorId ? Boolean(store.get(actorId)) : false,
+            })}`,
+          );
+
+          if (!actorId) {
+            logger.warn(
+              `Neo local runtime WebSocket rejected — missing actor id ${JSON.stringify({
+                path: url.pathname,
+                protocols: redactProtocols(protocols),
+              })}`,
+            );
+            return new Response("Unknown local Neo actor", { status: 404 });
+          }
+
+          // Resolve actor id via key lookup if it isn't a known id (DTW gateway
+          // paths may carry an actor id that is actually a thread key).
+          const resolved = store.get(actorId)
+            ? actorId
+            : (store.resolveActorIdByKey(actorId) ?? actorId);
+          if (!store.get(resolved)) {
+            logger.warn(
+              `Neo local runtime WebSocket rejected — unknown actor ${JSON.stringify({
+                actorId: resolved,
+                originalActorId: actorId,
+                path: url.pathname,
+                protocols: redactProtocols(protocols),
+              })}`,
+            );
+            return new Response("Unknown local Neo actor", { status: 404 });
+          }
+
+          // Negotiate the rivet subprotocol set. For a clean handshake we echo
+          // back the rivet base + skip-ready-wait + encoding so the client
+          // confirms its intended encoding/options.
+          const negotiated = chooseSubprotocol(protocols);
+          const headers = negotiated ? { "Sec-WebSocket-Protocol": negotiated } : undefined;
+          return srv.upgrade(req, { data: { actorId: resolved }, headers })
             ? undefined
             : new Response("Upgrade failed", { status: 400 });
         }
@@ -81,6 +164,114 @@ export function startNeoLocalRuntime(config: ProxyConfig, hostname: string): Ret
   }
 }
 
+function actorIdFromRequest(url: URL, protocols: string[], req: Request): string | null {
+  return (
+    extractActorIdFromProtocols(protocols) ??
+    url.searchParams.get("actorId") ??
+    url.searchParams.get("actor") ??
+    req.headers.get("x-rivet-actor") ??
+    actorIdFromGatewayPath(url.pathname)
+  );
+}
+
+function actorIdFromGatewayPath(pathname: string): string | null {
+  // Legacy form: /gateway/{actorId}@{token}/websocket/... or /gateway/{actorId}/websocket/...
+  // and /actors?/{actorId}/...
+  // Note: newer RivetKit gateway uses the *actor name* not id in this segment;
+  // the actor must be resolved from query params `rvt-method`/`rvt-key`/`rvt-input`.
+  const gateway = pathname.match(/^\/gateway\/([^/@]+)(?:@[^/]+)?(?:\/.*)?$/);
+  if (gateway) return decodeURIComponent(gateway[1]!);
+  const actor = pathname.match(/^\/actors?\/([^/]+)(?:\/.*)?$/);
+  if (actor) return decodeURIComponent(actor[1]!);
+  return null;
+}
+
+interface GatewayRequest {
+  actorName: string;
+  method: "getOrCreate" | "get" | "create";
+  key: string | null;
+  input: JsonRecord | null;
+  connParams: JsonRecord | null;
+  encoding: string | null;
+  skipReadyWait: boolean;
+}
+
+function parseGatewayRequest(url: URL, protocols: string[]): GatewayRequest | null {
+  const match = url.pathname.match(/^\/gateway\/([^/@]+)(?:\/.*)?$/);
+  if (!match) return null;
+  const actorName = decodeURIComponent(match[1]!);
+  const methodRaw = url.searchParams.get("rvt-method") ?? "";
+  if (!methodRaw) return null;
+  const method =
+    methodRaw === "getOrCreate" || methodRaw === "get" || methodRaw === "create" ? methodRaw : "getOrCreate";
+  const key = url.searchParams.get("rvt-key");
+  const input = parseJson(url.searchParams.get("rvt-input"));
+  const skipReadyWait = url.searchParams.get("rvt-skip-ready-wait") === "true";
+  let connParams: JsonRecord | null = null;
+  let encoding: string | null = null;
+  for (const protocol of protocols) {
+    if (protocol.startsWith("rivet_conn_params.")) {
+      connParams = parseJson(protocol.slice("rivet_conn_params.".length));
+    }
+    if (protocol.startsWith("rivet_encoding.")) {
+      encoding = protocol.slice("rivet_encoding.".length);
+    }
+  }
+  return {
+    actorName,
+    method,
+    key,
+    input: jsonRecordOrNull(input),
+    connParams: jsonRecordOrNull(connParams),
+    encoding,
+    skipReadyWait,
+  };
+}
+
+function parseJson(value: string | null): unknown {
+  if (!value) return null;
+  try {
+    return JSON.parse(decodeURIComponent(value));
+  } catch {
+    try {
+      return JSON.parse(value);
+    } catch {
+      return null;
+    }
+  }
+}
+
+function jsonRecordOrNull(value: unknown): JsonRecord | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonRecord) : null;
+}
+
+/** Pick the WebSocket subprotocol to confirm during the handshake.
+ *  RivetKit uses the chosen subprotocol primarily as metadata acknowledgement.
+ *  We echo the first offered protocol (typically "rivet") so the client treats
+ *  the handshake as accepted. */
+function chooseSubprotocol(protocols: string[]): string | null {
+  return protocols[0] ?? null;
+}
+
+function redactNeoSearch(search: string): string {
+  if (!search) return "";
+  const params = new URLSearchParams(search);
+  for (const key of [...params.keys()]) {
+    if (key.toLowerCase().includes("token")) params.set(key, "[redacted]");
+    if (key === "rvt-input") params.set(key, "[redacted]");
+  }
+  const rendered = params.toString();
+  return rendered ? `?${rendered}` : "";
+}
+
+function redactProtocols(protocols: string[]): string[] {
+  return protocols.map((protocol) => {
+    if (protocol.startsWith("rivet_token.")) return "rivet_token.[redacted]";
+    if (protocol.startsWith("rivet_conn_params.")) return "rivet_conn_params.[redacted]";
+    return protocol;
+  });
+}
+
 class ActorStore {
   private actors = new Map<string, StoredActor>();
   private byNameKey = new Map<string, string>();
@@ -107,14 +298,59 @@ class ActorStore {
     return this.actors.get(actorId);
   }
 
+  /** Resolve a thread key (or any key fragment) to a known actor id. Used so
+   *  WebSocket gateway paths that carry the thread id (rather than a generated
+   *  actor id) still find the correct local actor. */
+  resolveActorIdByKey(candidate: string): string | undefined {
+    if (this.actors.has(candidate)) return candidate;
+    for (const actor of this.actors.values()) {
+      if (actor.key === candidate) return actor.id;
+      if (actor.actor.snapshot().threadId === candidate) return actor.id;
+    }
+    return undefined;
+  }
+
+  /** Upsert from a RivetKit gateway WebSocket request. Treats the path's actor
+   *  name segment as the actor name and the `rvt-key` query as the actor key.
+   *  The `rvt-input` JSON becomes the actor's input. */
+  async upsertFromGateway(gateway: GatewayRequest): Promise<StoredActor & { created: boolean }> {
+    const body: JsonRecord = {
+      name: gateway.actorName,
+      key: gateway.key ?? undefined,
+      input: gateway.input ?? undefined,
+    };
+    const reuse = gateway.method !== "create";
+    return this.upsert(body, reuse);
+  }
+
   async handleHttp(req: Request, url: URL): Promise<Response> {
-    logger.info(`Neo local runtime HTTP ${JSON.stringify({ method: req.method, path: url.pathname })}`);
+    logger.info(
+      `Neo local runtime HTTP ${JSON.stringify({
+        method: req.method,
+        path: url.pathname,
+        search: url.search,
+      })}`,
+    );
     if (url.pathname === "/metadata" && req.method === "GET") return Response.json(METADATA);
     if (url.pathname.endsWith("/import") && req.method === "POST") return this.importThread(req, url);
     if (url.pathname === "/actors" && req.method === "GET") return Response.json({ actors: this.findActors(url) });
     if (url.pathname === "/actors" && (req.method === "PUT" || req.method === "POST")) {
       const body = await readJsonRecord(req);
       const stored = await this.upsert(body, req.method === "PUT");
+      return Response.json({ actor: stored.record, created: stored.created });
+    }
+
+    // RivetKit "manage"/"manager" style endpoints used by newer clients.
+    if (
+      (url.pathname === "/manage/getOrCreateForKey" ||
+        url.pathname === "/manager/getOrCreateForKey" ||
+        url.pathname === "/actors/getOrCreateForKey" ||
+        url.pathname === "/actors/get-or-create-for-key" ||
+        url.pathname === "/actors/get-or-create") &&
+      req.method === "POST"
+    ) {
+      const body = await readJsonRecord(req);
+      const stored = await this.upsert(body, true);
       return Response.json({ actor: stored.record, created: stored.created });
     }
 
@@ -165,7 +401,18 @@ class ActorStore {
     const existingId = key ? this.byNameKey.get(this.nameKey(name, key)) : undefined;
     if (reuse && existingId) {
       const existing = this.actors.get(existingId);
-      if (existing) return { ...existing, created: false };
+      if (existing) {
+        // Reuse path: the local snapshot may be stale if the user used another
+        // client (official AMP Neo, web UI, second machine) for this thread
+        // since we last touched it. Pull the latest from cloud and import it
+        // if cloud has progressed beyond our local copy. Without this, the
+        // connector serves a snapshot whose `seq` counter is behind what the
+        // CLI already has cached, so newly-broadcast messages get filtered
+        // out by the CLI as "older than what I already saw" and the prompt
+        // visually disappears.
+        await this.refreshFromCloudIfStale(existing);
+        return { ...existing, created: false };
+      }
     }
 
     const id = newActorId();
@@ -179,6 +426,35 @@ class ActorStore {
     if (cloudThread) actor.importCloudThread(cloudThread);
     this.save(id, name, key, record, actor.snapshot());
     return { ...stored, created: true };
+  }
+
+  /** When reusing an existing local actor, fetch the cloud thread and import
+   *  it iff cloud has more messages than local. Conservative: never overwrites
+   *  local when local has unsynced messages cloud does not yet know about. */
+  private async refreshFromCloudIfStale(stored: StoredActor): Promise<void> {
+    const localSnap = stored.actor.snapshot();
+    const threadId = localSnap.threadId;
+    if (!threadId) return;
+    let cloudThread: JsonRecord | null = null;
+    try {
+      cloudThread = await this.cloudSync.fetchThread(threadId);
+    } catch (err) {
+      logger.warn("Failed to refresh local Neo actor from cloud", {
+        threadId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return;
+    }
+    if (!cloudThread) return;
+    const cloudMessages = Array.isArray(cloudThread.messages) ? cloudThread.messages : [];
+    if (cloudMessages.length <= localSnap.messages.length) return;
+    logger.info("Refreshing local Neo actor from cloud", {
+      threadId,
+      localMessages: localSnap.messages.length,
+      cloudMessages: cloudMessages.length,
+    });
+    stored.actor.importCloudThread(cloudThread);
+    this.save(stored.id, stored.name, stored.key, stored.record, stored.actor.snapshot());
   }
 
   private createActor(
