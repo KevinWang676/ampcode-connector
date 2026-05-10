@@ -1081,8 +1081,49 @@ function googleContents(history: LocalHistoryMessage[], system: string): JsonRec
   return contents;
 }
 
+/** Normalize a tool's JSON-Schema-shaped `inputSchema` into a form every
+ *  upstream provider accepts.
+ *
+ *  - Anthropic's Messages API rejects `tools[].input_schema` whose `type` is
+ *    not exactly `"object"` ("input_schema.type: Field required" / "Input
+ *    should be 'object'").
+ *  - OpenAI's Chat Completions and Codex Responses APIs validate the
+ *    `function.parameters` JSON Schema and refuse anything that is not a
+ *    well-formed object schema.
+ *  - Google's Gemini `functionDeclarations[].parameters` similarly requires
+ *    `{ type: "OBJECT", properties: {...} }` shape.
+ *
+ *  Amp's local NeoLocalActor.registerTools coerces every incoming `inputSchema`
+ *  to a JsonRecord (defaulting to `{}` when the executor sends nothing), so by
+ *  the time we get here the value is never null/undefined — but it can still
+ *  be a typeless empty object `{}` or an object that defines `properties`
+ *  without declaring `"type": "object"`. The previous `?? { type: "object" }`
+ *  guard only triggered on null/undefined, leaving these typeless schemas to
+ *  reach Anthropic verbatim and 400 the request.
+ *
+ *  This normalizer:
+ *  - Forces `type: "object"` whenever it is missing (the only top-level
+ *    schema type any of the three providers accepts for a tool).
+ *  - Ensures `properties` is at least `{}` so the schema is structurally
+ *    valid and Gemini's strict shape check passes.
+ *  - Leaves user-supplied fields (`required`, `additionalProperties`,
+ *    `description`, `$defs`, etc.) intact so well-typed schemas pass through
+ *    unchanged.
+ *
+ *  Cross-platform: pure-logic transform with no environment dependencies. */
+export function normalizeToolSchema(schema: unknown): JsonRecord {
+  const base = schema && typeof schema === "object" && !Array.isArray(schema) ? { ...(schema as JsonRecord) } : {};
+  if (typeof base.type !== "string") base.type = "object";
+  if (base.type === "object") {
+    if (!base.properties || typeof base.properties !== "object" || Array.isArray(base.properties)) {
+      base.properties = {};
+    }
+  }
+  return base;
+}
+
 function toAnthropicTool(tool: NeoToolSpec): JsonRecord {
-  return { name: tool.name, description: tool.description ?? "", input_schema: tool.inputSchema ?? { type: "object" } };
+  return { name: tool.name, description: tool.description ?? "", input_schema: normalizeToolSchema(tool.inputSchema) };
 }
 
 function toOpenAITool(tool: NeoToolSpec): JsonRecord {
@@ -1091,13 +1132,13 @@ function toOpenAITool(tool: NeoToolSpec): JsonRecord {
     function: {
       name: tool.name,
       description: tool.description ?? "",
-      parameters: tool.inputSchema ?? { type: "object" },
+      parameters: normalizeToolSchema(tool.inputSchema),
     },
   };
 }
 
 function toGoogleFunctionDeclaration(tool: NeoToolSpec): JsonRecord {
-  return { name: tool.name, description: tool.description ?? "", parameters: tool.inputSchema ?? { type: "object" } };
+  return { name: tool.name, description: tool.description ?? "", parameters: normalizeToolSchema(tool.inputSchema) };
 }
 
 /** Normalize an Amp reasoning effort label to the OpenAI Responses-API value.

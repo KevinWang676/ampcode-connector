@@ -15,6 +15,7 @@ import {
   parseAnthropicSse,
   parseOpenAISse,
   selectModelRoute,
+  normalizeToolSchema,
 } from "../src/server/neo-local-inference.ts";
 import { NeoLocalPersistence, type PersistedActorState } from "../src/server/neo-local-persistence.ts";
 import {
@@ -768,6 +769,71 @@ describe("Neo history repair (orphan tool_use)", () => {
     expect(messages[3]?.role).toBe("tool");
     expect((messages[3] as Record<string, unknown>)?.tool_call_id).toBe("call-dup");
     expect((messages[3] as Record<string, unknown>)?.content).toBe("first result");
+  });
+});
+
+describe("normalizeToolSchema (tools[].input_schema / parameters validity for all providers)", () => {
+  test("undefined inputSchema → { type: \"object\", properties: {} }", () => {
+    const out = normalizeToolSchema(undefined);
+    expect(out.type).toBe("object");
+    expect(out.properties).toEqual({});
+  });
+
+  test("null inputSchema → { type: \"object\", properties: {} }", () => {
+    const out = normalizeToolSchema(null);
+    expect(out.type).toBe("object");
+    expect(out.properties).toEqual({});
+  });
+
+  test("typeless empty {} → { type: \"object\", properties: {} } (the production failure case)", () => {
+    const out = normalizeToolSchema({});
+    expect(out.type).toBe("object");
+    expect(out.properties).toEqual({});
+  });
+
+  test("schema with properties but no type → adds type:\"object\" and preserves properties", () => {
+    const out = normalizeToolSchema({ properties: { foo: { type: "string" } }, required: ["foo"] });
+    expect(out.type).toBe("object");
+    expect(out.properties).toEqual({ foo: { type: "string" } });
+    expect(out.required).toEqual(["foo"]);
+  });
+
+  test("well-typed object schema passes through unchanged (preserves $defs, additionalProperties, etc.)", () => {
+    const original = {
+      type: "object",
+      properties: { path: { type: "string", description: "absolute path" } },
+      required: ["path"],
+      additionalProperties: false,
+      $defs: { Foo: { type: "string" } },
+    };
+    const out = normalizeToolSchema(original);
+    expect(out.type).toBe("object");
+    expect(out.properties).toEqual(original.properties);
+    expect(out.required).toEqual(["path"]);
+    expect(out.additionalProperties).toBe(false);
+    expect(out.$defs).toEqual({ Foo: { type: "string" } });
+  });
+
+  test("non-object inputs (string, number, array) → safe default { type: \"object\", properties: {} }", () => {
+    expect(normalizeToolSchema("not a schema")).toEqual({ type: "object", properties: {} });
+    expect(normalizeToolSchema(42)).toEqual({ type: "object", properties: {} });
+    expect(normalizeToolSchema([1, 2, 3])).toEqual({ type: "object", properties: {} });
+  });
+
+  test("schema with non-object type is preserved (e.g. type:\"string\" — schema-author intent kept)", () => {
+    // We do NOT silently force "object" over an explicit type; if the
+    // executor really sent type:"string" we let upstream's strict validator
+    // surface the error rather than masking it with a coercion.
+    const out = normalizeToolSchema({ type: "string" });
+    expect(out.type).toBe("string");
+    // No properties added because type is not "object".
+    expect(out.properties).toBeUndefined();
+  });
+
+  test("schema with type:\"object\" but properties:[] (array, invalid) → properties replaced with {}", () => {
+    const out = normalizeToolSchema({ type: "object", properties: [] });
+    expect(out.type).toBe("object");
+    expect(out.properties).toEqual({});
   });
 });
 
