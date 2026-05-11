@@ -813,6 +813,7 @@ export class LocalThreadActor {
   }
 
   private setTitle(title: string | null): void {
+    if (this.title !== title) this.nextSeq();
     this.title = title;
     this.broadcast({ type: "thread_title", title });
     this.persist();

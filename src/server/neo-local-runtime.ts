@@ -113,9 +113,7 @@ export function startNeoLocalRuntime(config: ProxyConfig, hostname: string): Ret
 
           // Resolve actor id via key lookup if it isn't a known id (DTW gateway
           // paths may carry an actor id that is actually a thread key).
-          const resolved = store.get(actorId)
-            ? actorId
-            : (store.resolveActorIdByKey(actorId) ?? actorId);
+          const resolved = store.get(actorId) ? actorId : (store.resolveActorIdByKey(actorId) ?? actorId);
           if (!store.get(resolved)) {
             logger.warn(
               `Neo local runtime WebSocket rejected — unknown actor ${JSON.stringify({
@@ -211,7 +209,7 @@ function parseGatewayRequest(url: URL, protocols: string[]): GatewayRequest | nu
   let encoding: string | null = null;
   for (const protocol of protocols) {
     if (protocol.startsWith("rivet_conn_params.")) {
-      connParams = parseJson(protocol.slice("rivet_conn_params.".length));
+      connParams = jsonRecordOrNull(parseJson(protocol.slice("rivet_conn_params.".length)));
     }
     if (protocol.startsWith("rivet_encoding.")) {
       encoding = protocol.slice("rivet_encoding.".length);

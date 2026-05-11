@@ -2,20 +2,20 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { clampReasoningEffort } from "../src/providers/codex.ts";
 import { cloudThreadFromActor } from "../src/server/neo-cloud-sync.ts";
 import { LocalThreadActor, localFindThreadRun, localReadThreadRun } from "../src/server/neo-local-actor.ts";
-import { clampReasoningEffort } from "../src/providers/codex.ts";
 import {
   anthropicMaxOutputTokens,
   anthropicMessages,
   anthropicThinking,
   googleMaxOutputTokens,
+  normalizeToolSchema,
   openAIMessages,
   openAIReasoningEffort,
   parseAnthropicSse,
   parseOpenAISse,
   selectModelRoute,
-  normalizeToolSchema,
 } from "../src/server/neo-local-inference.ts";
 import { NeoLocalPersistence, type PersistedActorState } from "../src/server/neo-local-persistence.ts";
 import {
@@ -301,10 +301,7 @@ describe("LocalThreadActor importCloudThread (used by stale-snapshot refresh on 
       seq: number;
       history: Array<{ role: string }>;
     };
-    internal.messages = [
-      { seq: 1, role: "user" } as never,
-      { seq: 2, role: "assistant" } as never,
-    ];
+    internal.messages = [{ seq: 1, role: "user" } as never, { seq: 2, role: "assistant" } as never];
     internal.seq = 3;
 
     // Cloud has 5 messages — strictly newer than local's 2.
@@ -422,6 +419,68 @@ describe("Neo cloud sync shape", () => {
         },
       ]),
     );
+  });
+
+  test("renaming a thread advances the cloud upload version", () => {
+    const threadId = "T-82345678-1234-1234-1234-123456789abc";
+    const actor = new LocalThreadActor({
+      config: {
+        hostname: "localhost",
+        port: 8765,
+        ampUpstreamUrl: "https://ampcode.com",
+        logLevel: "error",
+        providers: { anthropic: true, codex: true, google: true },
+      },
+      actorId: "actor-title-test",
+      threadId,
+      snapshot: {
+        version: 1,
+        actorId: "actor-title-test",
+        threadId,
+        settings: {},
+        messages: [
+          {
+            threadId,
+            role: "user",
+            messageId: "M-8234567890123456789011",
+            content: [{ type: "text", text: "old title source" }],
+            seq: 1,
+          },
+        ],
+        history: [{ role: "user", text: "old title source" }],
+        queue: [],
+        seq: 2,
+        agentState: "idle",
+        environment: {},
+        title: "Old title",
+        updatedAt: "2026-05-07T00:00:00.000Z",
+      },
+    });
+    const before = cloudThreadFromActor({
+      version: 1,
+      id: "actor-title-test",
+      name: "thread-actor",
+      key: threadId,
+      record: actorRecord("actor-title-test", "thread-actor", threadId, "2026-05-07T00:00:00.000Z"),
+      snapshot: actor.snapshot(),
+      updatedAt: "2026-05-07T00:00:00.000Z",
+    });
+    const sent: unknown[] = [];
+    const ws = { readyState: WebSocket.OPEN, send: (v: string) => sent.push(JSON.parse(v)) };
+
+    actor.message(ws as never, JSON.stringify({ type: "client_set_thread_title", title: "New title" }));
+
+    const after = cloudThreadFromActor({
+      version: 1,
+      id: "actor-title-test",
+      name: "thread-actor",
+      key: threadId,
+      record: actorRecord("actor-title-test", "thread-actor", threadId, "2026-05-07T00:00:00.000Z"),
+      snapshot: actor.snapshot(),
+      updatedAt: "2026-05-07T00:00:00.000Z",
+    });
+    expect(after.title).toBe("New title");
+    expect(Number(after.v)).toBeGreaterThan(Number(before.v));
   });
 });
 
@@ -580,7 +639,11 @@ describe("Neo history repair (orphan tool_use)", () => {
   test("synthesizes tool_result when assistant tool_use is followed by a plain user text turn", () => {
     const messages = anthropicMessages([
       { role: "user", text: "first user msg" },
-      { role: "assistant", text: "ok let me search", toolCalls: [{ id: "TU-orphan-1", name: "Grep", input: { pattern: "x" } }] },
+      {
+        role: "assistant",
+        text: "ok let me search",
+        toolCalls: [{ id: "TU-orphan-1", name: "Grep", input: { pattern: "x" } }],
+      },
       // Note: NO {role: "tool", toolCallId: "TU-orphan-1"} here — corrupted history.
       { role: "user", text: "second user msg after orphan" },
     ]);
@@ -773,25 +836,25 @@ describe("Neo history repair (orphan tool_use)", () => {
 });
 
 describe("normalizeToolSchema (tools[].input_schema / parameters validity for all providers)", () => {
-  test("undefined inputSchema → { type: \"object\", properties: {} }", () => {
+  test('undefined inputSchema → { type: "object", properties: {} }', () => {
     const out = normalizeToolSchema(undefined);
     expect(out.type).toBe("object");
     expect(out.properties).toEqual({});
   });
 
-  test("null inputSchema → { type: \"object\", properties: {} }", () => {
+  test('null inputSchema → { type: "object", properties: {} }', () => {
     const out = normalizeToolSchema(null);
     expect(out.type).toBe("object");
     expect(out.properties).toEqual({});
   });
 
-  test("typeless empty {} → { type: \"object\", properties: {} } (the production failure case)", () => {
+  test('typeless empty {} → { type: "object", properties: {} } (the production failure case)', () => {
     const out = normalizeToolSchema({});
     expect(out.type).toBe("object");
     expect(out.properties).toEqual({});
   });
 
-  test("schema with properties but no type → adds type:\"object\" and preserves properties", () => {
+  test('schema with properties but no type → adds type:"object" and preserves properties', () => {
     const out = normalizeToolSchema({ properties: { foo: { type: "string" } }, required: ["foo"] });
     expect(out.type).toBe("object");
     expect(out.properties).toEqual({ foo: { type: "string" } });
@@ -814,13 +877,13 @@ describe("normalizeToolSchema (tools[].input_schema / parameters validity for al
     expect(out.$defs).toEqual({ Foo: { type: "string" } });
   });
 
-  test("non-object inputs (string, number, array) → safe default { type: \"object\", properties: {} }", () => {
+  test('non-object inputs (string, number, array) → safe default { type: "object", properties: {} }', () => {
     expect(normalizeToolSchema("not a schema")).toEqual({ type: "object", properties: {} });
     expect(normalizeToolSchema(42)).toEqual({ type: "object", properties: {} });
     expect(normalizeToolSchema([1, 2, 3])).toEqual({ type: "object", properties: {} });
   });
 
-  test("schema with non-object type is preserved (e.g. type:\"string\" — schema-author intent kept)", () => {
+  test('schema with non-object type is preserved (e.g. type:"string" — schema-author intent kept)', () => {
     // We do NOT silently force "object" over an explicit type; if the
     // executor really sent type:"string" we let upstream's strict validator
     // surface the error rather than masking it with a coercion.
@@ -830,7 +893,7 @@ describe("normalizeToolSchema (tools[].input_schema / parameters validity for al
     expect(out.properties).toBeUndefined();
   });
 
-  test("schema with type:\"object\" but properties:[] (array, invalid) → properties replaced with {}", () => {
+  test('schema with type:"object" but properties:[] (array, invalid) → properties replaced with {}', () => {
     const out = normalizeToolSchema({ type: "object", properties: [] });
     expect(out.type).toBe("object");
     expect(out.properties).toEqual({});
@@ -942,7 +1005,9 @@ describe("Neo OpenAI SSE parser", () => {
             index: 0,
             delta: {
               role: "assistant",
-              tool_calls: [{ index: 0, id: "call_test_1", type: "function", function: { name: "create_file", arguments: "" } }],
+              tool_calls: [
+                { index: 0, id: "call_test_1", type: "function", function: { name: "create_file", arguments: "" } },
+              ],
             },
             finish_reason: null,
           },
@@ -980,7 +1045,9 @@ describe("Neo OpenAI SSE parser", () => {
             index: 0,
             delta: {
               role: "assistant",
-              tool_calls: [{ index: 0, id: "call_trunc_1", type: "function", function: { name: "create_file", arguments: "" } }],
+              tool_calls: [
+                { index: 0, id: "call_trunc_1", type: "function", function: { name: "create_file", arguments: "" } },
+              ],
             },
             finish_reason: null,
           },
