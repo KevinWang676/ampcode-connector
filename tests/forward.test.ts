@@ -737,6 +737,292 @@ describe("bufferResponseJson", () => {
   });
 });
 
+describe("end-to-end cache_control survival: buildAnthropicInferenceBody → prepareAnthropicBody (the exact flow `inferAnthropic` follows)", () => {
+  test("a body produced by the neo-local inference builder reaches the wire with all 3 cache breakpoints intact", async () => {
+    // Lazy import to avoid forcing neo-local-runtime test deps into this file.
+    const { buildAnthropicInferenceBody } = await import("../src/server/neo-local-inference.ts");
+
+    const inferenceBody = buildAnthropicInferenceBody(
+      "claude-opus-4-7",
+      {
+        actorId: "actor-1",
+        threadId: "T-cache-1",
+        agentMode: "smart",
+        settings: {},
+        history: [{ role: "user", text: "explain the codebase" }],
+        tools: [
+          { name: "Read", description: "read a file", inputSchema: { type: "object", properties: {} } },
+          { name: "Bash", description: "run a shell command", inputSchema: { type: "object", properties: {} } },
+        ],
+        environment: { workingDirectory: "/home/u/proj" },
+      },
+      true,
+    );
+
+    // Serialize through parseBody (the boundary inferAnthropic uses) and run
+    // the same prepareAnthropicBody that the live forward path runs.
+    const body = parseBody(JSON.stringify(inferenceBody), "/v1/messages");
+    const onWire = JSON.parse(prepareAnthropicBody(body)) as {
+      cache_control?: { type: string };
+      system: Array<{ type: string; text: string; cache_control?: { type: string } }>;
+      tools: Array<{ name: string; cache_control?: { type: string } }>;
+      messages: unknown[];
+    };
+
+    // 1. Top-level cache_control survives → Anthropic's automatic caching is
+    //    enabled (sliding breakpoint on the latest user/tool_result block).
+    expect(onWire.cache_control).toEqual({ type: "ephemeral" });
+
+    // 2. injectClaudeCodeSystem prepended [billing, identity] BEFORE the
+    //    locally-built system block. The cache_control marker we set in
+    //    buildAnthropicInferenceBody MUST still be on the array tail so the
+    //    cached prefix covers [billing, identity, systemPrompt].
+    expect(onWire.system).toHaveLength(3);
+    expect(onWire.system[0]?.text).toMatch(/^x-anthropic-billing-header:/);
+    expect(onWire.system[0]?.cache_control).toBeUndefined();
+    expect(onWire.system[1]?.text).toBe("You are Claude Code, Anthropic's official CLI for Claude.");
+    expect(onWire.system[1]?.cache_control).toBeUndefined();
+    expect(onWire.system[2]?.text).toContain("You are Amp");
+    expect(onWire.system[2]?.cache_control).toEqual({ type: "ephemeral" });
+
+    // 3. The last tool definition's cache_control survives tool-name rewriting
+    //    (Read and Bash are Claude Code builtins → no prefix → unchanged
+    //    names, but the marker is still there).
+    expect(onWire.tools).toHaveLength(2);
+    expect(onWire.tools[0]?.name).toBe("Read");
+    expect(onWire.tools[0]?.cache_control).toBeUndefined();
+    expect(onWire.tools[1]?.name).toBe("Bash");
+    expect(onWire.tools[1]?.cache_control).toEqual({ type: "ephemeral" });
+
+    // 4. Total cache_control slots used = 3 (top-level + system + last tool),
+    //    well under Anthropic's 4-marker hard cap.
+    const markerCount =
+      (onWire.cache_control ? 1 : 0) +
+      onWire.system.filter((s) => s.cache_control).length +
+      onWire.tools.filter((t) => t.cache_control).length;
+    expect(markerCount).toBe(3);
+    expect(markerCount).toBeLessThanOrEqual(4);
+  });
+
+  test("Amp-custom tool names (oracle, create_handoff_context) get the mcp__amp__ prefix BUT keep their cache_control marker", async () => {
+    const { buildAnthropicInferenceBody } = await import("../src/server/neo-local-inference.ts");
+    const inferenceBody = buildAnthropicInferenceBody(
+      "claude-opus-4-7",
+      {
+        actorId: "actor-1",
+        threadId: "T-cache-2",
+        agentMode: "smart",
+        settings: {},
+        history: [{ role: "user", text: "audit the codebase" }],
+        tools: [
+          { name: "Read", description: "", inputSchema: { type: "object", properties: {} } },
+          { name: "oracle", description: "", inputSchema: { type: "object", properties: {} } },
+        ],
+      },
+      true,
+    );
+    const body = parseBody(JSON.stringify(inferenceBody), "/v1/messages");
+    const onWire = JSON.parse(prepareAnthropicBody(body)) as {
+      tools: Array<{ name: string; cache_control?: { type: string } }>;
+    };
+
+    // Read is a Claude Code builtin and passes through; oracle is Amp-custom
+    // and gets the mcp__amp__ prefix. The cache marker on the last entry
+    // (oracle) must survive the rename.
+    expect(onWire.tools[0]?.name).toBe("Read");
+    expect(onWire.tools[1]?.name).toBe("mcp__amp__oracle");
+    expect(onWire.tools[1]?.cache_control).toEqual({ type: "ephemeral" });
+  });
+
+  test("the wire body is byte-stable across two identical agent turns (cache prefix-hash will match)", async () => {
+    // Anthropic caches by exact prefix hash. If anything in the wire body
+    // varies between two identical inputs (timestamps, random ids, key
+    // ordering, etc.) we never get a cache hit. This test asserts the full
+    // pipeline (buildAnthropicInferenceBody → parseBody → prepareAnthropicBody)
+    // produces the same bytes for the same inputs.
+    const { buildAnthropicInferenceBody } = await import("../src/server/neo-local-inference.ts");
+    const buildOnce = (): string => {
+      const inferenceBody = buildAnthropicInferenceBody(
+        "claude-opus-4-7",
+        {
+          actorId: "actor-1",
+          threadId: "T-cache-3",
+          agentMode: "smart",
+          settings: {},
+          history: [{ role: "user", text: "explain the codebase" }],
+          tools: [{ name: "Read", description: "", inputSchema: { type: "object", properties: {} } }],
+          environment: { workingDirectory: "/home/u/proj" },
+        },
+        true,
+      );
+      const body = parseBody(JSON.stringify(inferenceBody), "/v1/messages");
+      return prepareAnthropicBody(body);
+    };
+    expect(buildOnce()).toBe(buildOnce());
+  });
+});
+
+describe("prepareAnthropicBody — prompt cache_control wiring (fixes 10× Max-subscription burn vs `amp --take-me-back`)", () => {
+  test("attaches cache_control to the LAST system block when upstream sent none", () => {
+    const body = parseBody(
+      JSON.stringify({
+        max_tokens: 4096,
+        messages: [{ role: "user", content: "explain the codebase" }],
+        system: [{ type: "text", text: "You are an Amp coding agent." }],
+      }),
+      "/v1/messages",
+    );
+
+    const prepared = JSON.parse(prepareAnthropicBody(body)) as {
+      system: Array<{ type: string; text: string; cache_control?: { type: string } }>;
+    };
+
+    // Defensive marker MUST land on the final system block (the original
+    // upstream content), NOT on the billing header — the billing classifier
+    // rejects requests that put cache_control on the first block.
+    expect(prepared.system).toHaveLength(3);
+    expect(prepared.system[0]?.text).toMatch(/^x-anthropic-billing-header:/);
+    expect(prepared.system[0]?.cache_control).toBeUndefined();
+    expect(prepared.system[1]?.cache_control).toBeUndefined();
+    expect(prepared.system[2]?.text).toBe("You are an Amp coding agent.");
+    expect(prepared.system[2]?.cache_control).toEqual({ type: "ephemeral" });
+  });
+
+  test("attaches cache_control to the identity block when upstream system is empty", () => {
+    const body = parseBody(
+      JSON.stringify({
+        max_tokens: 4096,
+        messages: [{ role: "user", content: "hello" }],
+        // No `system` field at all.
+      }),
+      "/v1/messages",
+    );
+
+    const prepared = JSON.parse(prepareAnthropicBody(body)) as {
+      system: Array<{ type: string; text: string; cache_control?: { type: string } }>;
+    };
+
+    expect(prepared.system).toHaveLength(2);
+    expect(prepared.system[0]?.text).toMatch(/^x-anthropic-billing-header:/);
+    expect(prepared.system[0]?.cache_control).toBeUndefined();
+    // Identity block is the array tail → it gets the marker.
+    expect(prepared.system[1]?.text).toBe("You are Claude Code, Anthropic's official CLI for Claude.");
+    expect(prepared.system[1]?.cache_control).toEqual({ type: "ephemeral" });
+  });
+
+  test("preserves upstream cache_control markers untouched (no double-marking)", () => {
+    const body = parseBody(
+      JSON.stringify({
+        max_tokens: 4096,
+        messages: [{ role: "user", content: "hi" }],
+        system: [
+          { type: "text", text: "Stable preamble." },
+          {
+            type: "text",
+            text: "Upstream-marked content.",
+            cache_control: { type: "ephemeral" },
+          },
+        ],
+      }),
+      "/v1/messages",
+    );
+
+    const prepared = JSON.parse(prepareAnthropicBody(body)) as {
+      system: Array<{ type: string; text: string; cache_control?: { type: string } }>;
+    };
+
+    // Upstream already supplied a marker → defensive logic is a no-op.
+    expect(prepared.system).toHaveLength(4);
+    expect(prepared.system[0]?.cache_control).toBeUndefined();
+    expect(prepared.system[1]?.cache_control).toBeUndefined();
+    expect(prepared.system[2]?.cache_control).toBeUndefined();
+    expect(prepared.system[3]?.text).toBe("Upstream-marked content.");
+    expect(prepared.system[3]?.cache_control).toEqual({ type: "ephemeral" });
+  });
+
+  test("never attaches cache_control to the billing header itself", () => {
+    // Pathological case: upstream sent ONLY blocks that get filtered out
+    // (legacy claude-code identity), so after the prepend+filter the array
+    // would be just `[billing, identity]`. The marker MUST land on identity.
+    const body = parseBody(
+      JSON.stringify({
+        max_tokens: 4096,
+        messages: [{ role: "user", content: "hi" }],
+        system: [
+          { type: "text", text: "x-anthropic-billing-header: cc_version=stale; cc_entrypoint=cli; cch=00000;" },
+          { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." },
+        ],
+      }),
+      "/v1/messages",
+    );
+
+    const prepared = JSON.parse(prepareAnthropicBody(body)) as {
+      system: Array<{ type: string; text: string; cache_control?: { type: string } }>;
+    };
+
+    expect(prepared.system).toHaveLength(2);
+    expect(prepared.system[0]?.text).toMatch(/^x-anthropic-billing-header:/);
+    expect(prepared.system[0]?.cache_control).toBeUndefined();
+    expect(prepared.system[1]?.text).toBe("You are Claude Code, Anthropic's official CLI for Claude.");
+    expect(prepared.system[1]?.cache_control).toEqual({ type: "ephemeral" });
+  });
+
+  test("preserves a top-level cache_control field through prepareBody", () => {
+    // The neo-local inference path sets `cache_control: { type: "ephemeral" }`
+    // at the top level (Anthropic's automatic-caching feature). Verify it
+    // round-trips through prepareBody so the message-level cache breakpoint
+    // actually reaches api.anthropic.com.
+    const body = parseBody(
+      JSON.stringify({
+        max_tokens: 4096,
+        cache_control: { type: "ephemeral" },
+        messages: [{ role: "user", content: "hi" }],
+        system: [{ type: "text", text: "Amp system." }],
+      }),
+      "/v1/messages",
+    );
+
+    const prepared = JSON.parse(prepareAnthropicBody(body)) as {
+      cache_control?: { type: string };
+      system: Array<{ cache_control?: { type: string } }>;
+    };
+
+    expect(prepared.cache_control).toEqual({ type: "ephemeral" });
+    // System still gets its defensive marker — both breakpoints coexist.
+    expect(prepared.system[2]?.cache_control).toEqual({ type: "ephemeral" });
+  });
+
+  test("preserves cache_control on tool definitions (last tool keeps its marker)", () => {
+    // Mirrors the body shape `buildAnthropicInferenceBody` produces in the neo
+    // path. prepareAnthropicBody must not strip or reshape the tools array in
+    // a way that drops the cache marker.
+    const body = parseBody(
+      JSON.stringify({
+        max_tokens: 4096,
+        messages: [{ role: "user", content: "hi" }],
+        tools: [
+          { name: "Read", description: "", input_schema: { type: "object" } },
+          {
+            name: "Bash",
+            description: "",
+            input_schema: { type: "object" },
+            cache_control: { type: "ephemeral" },
+          },
+        ],
+      }),
+      "/v1/messages",
+    );
+
+    const prepared = JSON.parse(prepareAnthropicBody(body)) as {
+      tools: Array<{ name: string; cache_control?: { type: string } }>;
+    };
+
+    expect(prepared.tools).toHaveLength(2);
+    expect(prepared.tools[0]?.cache_control).toBeUndefined();
+    expect(prepared.tools[1]?.cache_control).toEqual({ type: "ephemeral" });
+  });
+});
+
 describe("denied", () => {
   test("returns 401 with provider name", async () => {
     const res = denied("Anthropic");

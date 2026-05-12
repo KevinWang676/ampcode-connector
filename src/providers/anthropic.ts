@@ -222,22 +222,66 @@ function stripClaudeCodeAttribution(text: string): string {
 /** Prepend `[billing header, Claude Code identity]` to the system blocks.
  *  The billing header MUST be the first system entry (no cache_control) and the
  *  identity MUST follow immediately for api.anthropic.com to bill against the
- *  Max subscription instead of API credits. */
+ *  Max subscription instead of API credits.
+ *
+ *  After prepending, this function also guarantees the resulting system array
+ *  has at least one `cache_control` marker — see `ensureSystemCacheBreakpoint`
+ *  below for the full rationale and safety constraints. */
 function injectClaudeCodeSystem(system: unknown, billingLine: string): unknown {
   const prefix = [
     { type: "text", text: billingLine },
     { type: "text", text: CLAUDE_CODE_IDENTITY },
   ];
 
+  let combined: Array<Record<string, unknown>>;
   if (Array.isArray(system)) {
     const filtered = system.filter((s) => !isClaudeCodeAttributionBlock(s));
-    return [...prefix, ...filtered];
-  }
-  if (typeof system === "string") {
+    combined = [...prefix, ...(filtered as Array<Record<string, unknown>>)];
+  } else if (typeof system === "string") {
     const cleaned = stripClaudeCodeAttribution(system);
-    return cleaned ? [...prefix, { type: "text", text: cleaned }] : prefix;
+    combined = cleaned ? [...prefix, { type: "text", text: cleaned }] : [...prefix];
+  } else {
+    combined = [...prefix];
   }
-  return prefix;
+
+  ensureSystemCacheBreakpoint(combined);
+  return combined;
+}
+
+/** Guarantee at least one `cache_control` marker exists in the prepared system
+ *  array so the system prefix participates in Anthropic's prompt cache. Without
+ *  this, every request paid full input-token price for the system block — the
+ *  root cause of the neo-fix branch consuming a Max-5x subscription ~10x faster
+ *  than `amp --take-me-back` for the same agentic loop.
+ *
+ *  Constraints we honour:
+ *
+ *   • The billing header (first block) MUST stay un-marked. The api.anthropic.com
+ *     billing classifier inspects it verbatim to bill against the Max
+ *     subscription, and the existing convention here is "billing header first,
+ *     no cache_control". We therefore attach the marker to the LAST block,
+ *     which is either the connector's `CLAUDE_CODE_IDENTITY` line (when
+ *     upstream sent no system content) or the final upstream system block.
+ *     Both stay identical within a conversation, so the prefix hash is stable.
+ *
+ *   • If any block already carries `cache_control` (e.g. `amp --take-me-back`
+ *     or a future Amp build sends its own breakpoints), we leave the array
+ *     untouched. This preserves the caller's intent and keeps us under the
+ *     4-marker hard cap Anthropic enforces.
+ *
+ *   • We never invent a marker on an empty system array — there's nothing to
+ *     cache, and Anthropic's automatic-caching feature handles message-only
+ *     requests via the top-level `cache_control` field already on the body. */
+function ensureSystemCacheBreakpoint(system: Array<Record<string, unknown>>): void {
+  if (system.length === 0) return;
+  for (const block of system) {
+    if (block && typeof block === "object" && "cache_control" in block) return;
+  }
+  const lastIdx = system.length - 1;
+  const last = system[lastIdx]!;
+  const lastText = typeof last.text === "string" ? last.text : "";
+  if (lastText.startsWith("x-anthropic-billing-header:")) return;
+  system[lastIdx] = { ...last, cache_control: { type: "ephemeral" } };
 }
 
 function betaHeader(original: string | null): string {

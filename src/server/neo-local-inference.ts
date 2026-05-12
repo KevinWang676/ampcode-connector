@@ -240,6 +240,74 @@ export function anthropicThinking(
   return { type: "enabled", budget_tokens: budget };
 }
 
+/** Build the JSON body for a connector-local Anthropic `/v1/messages` call.
+ *
+ *  Prompt caching is enabled with the Claude Code-style 3-of-4 breakpoint
+ *  pattern so the running cost matches `amp --take-me-back` instead of paying
+ *  full input-token price every turn:
+ *
+ *    1. Top-level `cache_control: { type: "ephemeral" }` → automatic caching.
+ *       Anthropic places a sliding breakpoint on the last cacheable block
+ *       (typically the latest `tool_result` / user message) every request,
+ *       which keeps the growing message history in cache for multi-turn
+ *       agentic loops (e.g. Amp's "explain the codebase" flow) without us
+ *       having to walk the array each turn.
+ *
+ *    2. Explicit `cache_control` on the LAST tool definition. Tools rarely
+ *       change inside an Amp session, so this entry survives the full
+ *       conversation and the tool prefix is read from cache from turn 2 on.
+ *
+ *    3. Explicit `cache_control` on the LAST system block. The connector's
+ *       providers/anthropic.ts::injectClaudeCodeSystem prepends a billing
+ *       header (stable per conversation via `cch`) and the Claude Code
+ *       identity line; after that injection the locally-built system block
+ *       is the array's tail, so the cached prefix covers
+ *       `[billing, identity, systemPrompt]` — all stable per conversation.
+ *
+ *  The fourth `cache_control` slot is intentionally left free so that a
+ *  caller (or `injectClaudeCodeSystem`'s defensive marker) can add a
+ *  second breakpoint without exceeding Anthropic's 4-marker hard cap.
+ *
+ *  Exported so tests can validate the exact body shape without spinning up
+ *  the routing/forwarding stack. */
+export function buildAnthropicInferenceBody(
+  model: string,
+  request: LocalInferenceRequest,
+  streaming: boolean,
+): JsonRecord {
+  const maxTokens = anthropicMaxOutputTokens(model);
+  const thinking = anthropicThinking(model, request.reasoningEffort, maxTokens);
+  const tools = buildCachedAnthropicTools(request.tools);
+  return {
+    model,
+    max_tokens: maxTokens,
+    stream: streaming,
+    cache_control: { type: "ephemeral" as const },
+    ...(thinking ? { thinking } : {}),
+    system: [
+      {
+        type: "text",
+        text: systemPrompt(request),
+        cache_control: { type: "ephemeral" as const },
+      },
+    ],
+    messages: anthropicMessages(request.history),
+    ...(tools.length > 0 ? { tools, tool_choice: { type: "auto" as const } } : {}),
+  };
+}
+
+/** Map NeoToolSpec[] to Anthropic tool definitions and stamp a single
+ *  `cache_control: { type: "ephemeral" }` marker on the LAST entry so the
+ *  whole tool-definition prefix is cached as one segment. Returns `[]` when
+ *  the spec list is empty so callers can omit the `tools` field entirely. */
+function buildCachedAnthropicTools(tools: NeoToolSpec[]): JsonRecord[] {
+  if (tools.length === 0) return [];
+  const list = tools.map(toAnthropicTool);
+  const lastIdx = list.length - 1;
+  list[lastIdx] = { ...list[lastIdx]!, cache_control: { type: "ephemeral" as const } };
+  return list;
+}
+
 async function inferAnthropic(
   config: ProxyConfig,
   request: LocalInferenceRequest,
@@ -247,19 +315,7 @@ async function inferAnthropic(
   handler?: InferenceStreamHandler,
 ): Promise<LocalInferenceResult> {
   const streaming = !!handler;
-  const maxTokens = anthropicMaxOutputTokens(route.model);
-  const thinking = anthropicThinking(route.model, request.reasoningEffort, maxTokens);
-  const body = {
-    model: route.model,
-    max_tokens: maxTokens,
-    stream: streaming,
-    ...(thinking ? { thinking } : {}),
-    system: [{ type: "text", text: systemPrompt(request) }],
-    messages: anthropicMessages(request.history),
-    ...(request.tools.length > 0
-      ? { tools: request.tools.map(toAnthropicTool), tool_choice: { type: "auto" as const } }
-      : {}),
-  };
+  const body = buildAnthropicInferenceBody(route.model, request, streaming);
 
   if (!streaming) {
     const json = await callLocalProvider(config, "anthropic", "/v1/messages", body, request.threadId, request.signal);

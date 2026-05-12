@@ -9,6 +9,7 @@ import {
   anthropicMaxOutputTokens,
   anthropicMessages,
   anthropicThinking,
+  buildAnthropicInferenceBody,
   googleMaxOutputTokens,
   normalizeToolSchema,
   openAIMessages,
@@ -500,6 +501,97 @@ describe("Neo local model routing", () => {
       provider: "openai",
       model: "gpt-5.4",
     });
+  });
+});
+
+describe("buildAnthropicInferenceBody — prompt cache_control wiring", () => {
+  const baseRequest = {
+    actorId: "actor-1",
+    threadId: "T-1234",
+    agentMode: "smart",
+    settings: {},
+    history: [{ role: "user" as const, text: "explain the codebase" }],
+    tools: [
+      { name: "Read", description: "read a file", inputSchema: { type: "object", properties: {} } },
+      { name: "Bash", description: "run a shell command", inputSchema: { type: "object", properties: {} } },
+    ],
+    environment: { workingDirectory: "/home/u/proj" },
+  };
+
+  test("places top-level cache_control for automatic message caching", () => {
+    const body = buildAnthropicInferenceBody("claude-opus-4-7", baseRequest, true);
+    expect(body.cache_control).toEqual({ type: "ephemeral" });
+  });
+
+  test("places cache_control on the LAST system block (and only that block)", () => {
+    const body = buildAnthropicInferenceBody("claude-opus-4-7", baseRequest, true);
+    const system = body.system as Array<{ text: string; cache_control?: { type: string } }>;
+    expect(system).toHaveLength(1);
+    expect(system[0]?.cache_control).toEqual({ type: "ephemeral" });
+    expect(system[0]?.text).toContain("You are Amp");
+  });
+
+  test("places cache_control on the LAST tool definition only (tools prefix cached as one segment)", () => {
+    const body = buildAnthropicInferenceBody("claude-opus-4-7", baseRequest, true);
+    const tools = body.tools as Array<{ name: string; cache_control?: { type: string } }>;
+    expect(tools).toHaveLength(2);
+    expect(tools[0]?.name).toBe("Read");
+    expect(tools[0]?.cache_control).toBeUndefined();
+    expect(tools[1]?.name).toBe("Bash");
+    expect(tools[1]?.cache_control).toEqual({ type: "ephemeral" });
+  });
+
+  test("uses 3 of 4 cache_control slots (top-level + last system + last tool)", () => {
+    const body = buildAnthropicInferenceBody("claude-opus-4-7", baseRequest, true);
+    const markers: string[] = [];
+    if (body.cache_control) markers.push("top-level");
+    for (const s of body.system as Array<{ cache_control?: unknown }>) {
+      if (s.cache_control) markers.push("system");
+    }
+    for (const t of (body.tools ?? []) as Array<{ cache_control?: unknown }>) {
+      if (t.cache_control) markers.push("tool");
+    }
+    expect(markers).toEqual(["top-level", "system", "tool"]);
+    expect(markers.length).toBeLessThanOrEqual(4);
+  });
+
+  test("omits tools field entirely (and thus the tool breakpoint) when request.tools is empty", () => {
+    const body = buildAnthropicInferenceBody("claude-haiku-4-5-20251001", { ...baseRequest, tools: [] }, false);
+    expect(body.tools).toBeUndefined();
+    expect(body.tool_choice).toBeUndefined();
+    // Top-level + system breakpoints remain.
+    expect(body.cache_control).toEqual({ type: "ephemeral" });
+    const system = body.system as Array<{ cache_control?: { type: string } }>;
+    expect(system[0]?.cache_control).toEqual({ type: "ephemeral" });
+  });
+
+  test("body structure mirrors what api.anthropic.com expects (model, max_tokens, stream, messages all populated)", () => {
+    const body = buildAnthropicInferenceBody("claude-opus-4-7", baseRequest, true);
+    expect(body.model).toBe("claude-opus-4-7");
+    expect(typeof body.max_tokens).toBe("number");
+    expect(body.stream).toBe(true);
+    expect(Array.isArray(body.messages)).toBe(true);
+    expect((body.messages as unknown[]).length).toBeGreaterThan(0);
+  });
+
+  test("non-streaming requests still carry all three cache breakpoints", () => {
+    const body = buildAnthropicInferenceBody("claude-opus-4-7", baseRequest, false);
+    expect(body.stream).toBe(false);
+    expect(body.cache_control).toEqual({ type: "ephemeral" });
+    const system = body.system as Array<{ cache_control?: { type: string } }>;
+    expect(system[0]?.cache_control).toEqual({ type: "ephemeral" });
+    const tools = body.tools as Array<{ cache_control?: { type: string } }>;
+    expect(tools[tools.length - 1]?.cache_control).toEqual({ type: "ephemeral" });
+  });
+
+  test("cache_control content is byte-identical across calls with identical input (cache hash stability)", () => {
+    // Anthropic caches by an exact prefix hash. If buildAnthropicInferenceBody
+    // produced non-deterministic content (timestamps, random ids, etc.) for
+    // identical inputs, every turn would write a new entry and never read —
+    // exactly the regression we are fixing. Compare two builds for byte parity.
+    const first = JSON.stringify(buildAnthropicInferenceBody("claude-opus-4-7", baseRequest, true));
+    const second = JSON.stringify(buildAnthropicInferenceBody("claude-opus-4-7", baseRequest, true));
+    expect(first).toBe(second);
   });
 });
 
