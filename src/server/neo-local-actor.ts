@@ -356,7 +356,11 @@ export class LocalThreadActor {
     }
   }
   private updateSettings(settings: JsonRecord): void {
-    this.settings = settings;
+    const priorAgentMode = this.agentMode();
+    this.settings = {
+      ...settings,
+      ...(typeof settings.agentMode === "string" ? {} : { agentMode: priorAgentMode }),
+    };
     this.currentAgentMode = this.agentMode();
     this.broadcast({ type: "thread_settings", settings: this.settings });
     this.persist();
@@ -373,6 +377,11 @@ export class LocalThreadActor {
     this.environment = environment;
     this.broadcast({ type: "environment_update", environment });
     this.persist();
+  }
+  private persistAgentMode(agentMode: string): void {
+    if (this.settings.agentMode === agentMode) return;
+    this.settings = { ...this.settings, agentMode };
+    this.broadcast({ type: "thread_settings", settings: this.settings });
   }
   private completeExecutorBootstrap(msg: JsonRecord): void {
     if (msg.ok === false) {
@@ -412,6 +421,7 @@ export class LocalThreadActor {
   private startUserMessage(user: QueuedUserMessage): void {
     const effectiveAgentMode = user.agentMode ?? this.agentMode();
     const effectiveReasoningEffort = user.reasoningEffort ?? this.reasoningEffort();
+    this.persistAgentMode(effectiveAgentMode);
     const message = this.storeMessage({
       threadId: this.options.threadId,
       role: "user",
@@ -607,6 +617,8 @@ export class LocalThreadActor {
       messageId,
       role: "assistant",
       content: blocks,
+      agentMode,
+      reasoningEffort,
       state: { type: "complete", stopReason: toolCalls.length ? "tool_use" : "end_turn" },
       usage: neoUsage,
       createdAt: nowIso(),

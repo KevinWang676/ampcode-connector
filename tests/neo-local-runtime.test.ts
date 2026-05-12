@@ -492,6 +492,29 @@ describe("Neo local model routing", () => {
     expect(selectModelRoute("rush", {})).toEqual({ provider: "anthropic", model: "claude-haiku-4-5-20251001" });
   });
 
+  test("preserves deep mode in thread settings for inherited subagent model selection", () => {
+    const actor = new LocalThreadActor({
+      config: {
+        hostname: "localhost",
+        port: 8765,
+        ampUpstreamUrl: "https://ampcode.com",
+        logLevel: "error",
+        providers: { anthropic: true, codex: true, google: true },
+      },
+      actorId: "actor-deep-settings",
+      threadId: "T-92345678-1234-1234-1234-123456789abc",
+      input: { input: { agentMode: "deep" } },
+    });
+    const sent: unknown[] = [];
+    const ws = { readyState: WebSocket.OPEN, send: (v: string) => sent.push(JSON.parse(v)), close: () => {} };
+
+    actor.open(ws as never);
+    actor.message(ws as never, JSON.stringify({ type: "client_update_thread_settings", settings: {} }));
+
+    expect(actor.snapshot().settings.agentMode).toBe("deep");
+    expect(sent).toContainEqual({ type: "thread_settings", settings: { agentMode: "deep" } });
+  });
+
   test("honors internal.model overrides", () => {
     expect(selectModelRoute("smart", { "internal.model": "google/gemini-3-pro-preview" })).toEqual({
       provider: "google",
