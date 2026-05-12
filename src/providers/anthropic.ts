@@ -125,7 +125,7 @@ export function prepareBody(body: ParsedBody, userId?: string): string {
     const prepared = {
       ...rest,
       ...(metadata ? { metadata } : {}),
-      system: injectClaudeCodeSystem(existingSystem, billingLine),
+      system: injectClaudeCodeSystem(existingSystem, billingLine, rest),
     };
 
     rewriteAnthropicRequestToolNames(prepared);
@@ -227,7 +227,7 @@ function stripClaudeCodeAttribution(text: string): string {
  *  After prepending, this function also guarantees the resulting system array
  *  has at least one `cache_control` marker — see `ensureSystemCacheBreakpoint`
  *  below for the full rationale and safety constraints. */
-function injectClaudeCodeSystem(system: unknown, billingLine: string): unknown {
+function injectClaudeCodeSystem(system: unknown, billingLine: string, rest: Record<string, unknown>): unknown {
   const prefix = [
     { type: "text", text: billingLine },
     { type: "text", text: CLAUDE_CODE_IDENTITY },
@@ -244,7 +244,7 @@ function injectClaudeCodeSystem(system: unknown, billingLine: string): unknown {
     combined = [...prefix];
   }
 
-  ensureSystemCacheBreakpoint(combined);
+  ensureSystemCacheBreakpoint(combined, rest);
   return combined;
 }
 
@@ -266,22 +266,38 @@ function injectClaudeCodeSystem(system: unknown, billingLine: string): unknown {
  *
  *   • If any block already carries `cache_control` (e.g. `amp --take-me-back`
  *     or a future Amp build sends its own breakpoints), we leave the array
- *     untouched. This preserves the caller's intent and keeps us under the
- *     4-marker hard cap Anthropic enforces.
+ *     untouched. This preserves the caller's intent.
  *
  *   • We never invent a marker on an empty system array — there's nothing to
  *     cache, and Anthropic's automatic-caching feature handles message-only
  *     requests via the top-level `cache_control` field already on the body. */
-function ensureSystemCacheBreakpoint(system: Array<Record<string, unknown>>): void {
+function ensureSystemCacheBreakpoint(system: Array<Record<string, unknown>>, rest: Record<string, unknown>): void {
   if (system.length === 0) return;
   for (const block of system) {
     if (block && typeof block === "object" && "cache_control" in block) return;
   }
+  if (countCacheControls(rest) >= 4) return;
   const lastIdx = system.length - 1;
   const last = system[lastIdx]!;
   const lastText = typeof last.text === "string" ? last.text : "";
   if (lastText.startsWith("x-anthropic-billing-header:")) return;
   system[lastIdx] = { ...last, cache_control: { type: "ephemeral" } };
+}
+
+function countCacheControls(value: unknown): number {
+  if (!value || typeof value !== "object") return 0;
+  let count = hasEphemeralCacheControl(value) ? 1 : 0;
+  const entries = Array.isArray(value) ? value : Object.values(value);
+  for (const entry of entries) count += countCacheControls(entry);
+  return count;
+}
+
+function hasEphemeralCacheControl(value: object): boolean {
+  if (!("cache_control" in value)) return false;
+  const cacheControl = value.cache_control;
+  return (
+    !!cacheControl && typeof cacheControl === "object" && (cacheControl as { type?: unknown }).type === "ephemeral"
+  );
 }
 
 function betaHeader(original: string | null): string {

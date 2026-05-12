@@ -992,6 +992,46 @@ describe("prepareAnthropicBody — prompt cache_control wiring (fixes 10× Max-s
     expect(prepared.system[2]?.cache_control).toEqual({ type: "ephemeral" });
   });
 
+  test("does not add a system marker when the request already uses all four cache slots", () => {
+    const body = parseBody(
+      JSON.stringify({
+        max_tokens: 4096,
+        cache_control: { type: "ephemeral" },
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "first", cache_control: { type: "ephemeral" } },
+              { type: "text", text: "second", cache_control: { type: "ephemeral" } },
+            ],
+          },
+        ],
+        system: [{ type: "text", text: "Amp system." }],
+        tools: [
+          {
+            name: "Read",
+            description: "",
+            input_schema: { type: "object" },
+            cache_control: { type: "ephemeral" },
+          },
+        ],
+      }),
+      "/v1/messages",
+    );
+
+    const prepared = JSON.parse(prepareAnthropicBody(body)) as {
+      cache_control?: { type: string };
+      messages: Array<{ content: Array<{ cache_control?: { type: string } }> }>;
+      system: Array<{ cache_control?: { type: string } }>;
+      tools: Array<{ cache_control?: { type: string } }>;
+    };
+
+    expect(prepared.cache_control).toEqual({ type: "ephemeral" });
+    expect(prepared.messages[0]?.content.filter((block) => block.cache_control)).toHaveLength(2);
+    expect(prepared.tools[0]?.cache_control).toEqual({ type: "ephemeral" });
+    expect(prepared.system.some((block) => block.cache_control)).toBe(false);
+  });
+
   test("preserves cache_control on tool definitions (last tool keeps its marker)", () => {
     // Mirrors the body shape `buildAnthropicInferenceBody` produces in the neo
     // path. prepareAnthropicBody must not strip or reshape the tools array in
