@@ -6,7 +6,7 @@ import * as oauth from "../auth/oauth.ts";
 import * as store from "../auth/store.ts";
 import type { ProxyConfig } from "../config/config.ts";
 import { ANTIGRAVITY_DAILY_ENDPOINT, ANTIGRAVITY_DAILY_SANDBOX_ENDPOINT, CODE_ASSIST_ENDPOINT } from "../constants.ts";
-import { buildUrl, maybeWrap, withUnwrap } from "../utils/code-assist.ts";
+import { buildUrl, maybeWrap, stripGoogleThoughtSignatures, withUnwrap } from "../utils/code-assist.ts";
 import { logger } from "../utils/logger.ts";
 import * as path from "../utils/path.ts";
 import { apiError } from "../utils/responses.ts";
@@ -225,6 +225,15 @@ export function buildGeminiApiKeyUrl(
   return `${endpoint}/v1beta/models/${encodeURIComponent(model)}:${action}?${params.toString()}`;
 }
 
+export function prepareGeminiApiKeyBody(raw: string, parsed: Record<string, unknown> | null): string {
+  try {
+    const requestBody = parsed ?? (JSON.parse(raw) as Record<string, unknown>);
+    return JSON.stringify(stripGoogleThoughtSignatures(requestBody));
+  } catch {
+    return raw;
+  }
+}
+
 export const provider: Provider = {
   name: "Google",
   routeDecision: "LOCAL_GOOGLE",
@@ -278,10 +287,13 @@ export const provider: Provider = {
     for (const strategy of orderedStrategies) {
       const model = strategy.modelMapper ? strategy.modelMapper(modelAction.model) : modelAction.model;
       const isImageModel = model.includes("image");
-      const wrapOpts = isImageModel ? { ...strategy.wrapOpts, requestType: "image_gen" as const } : strategy.wrapOpts;
+      const stripThoughtSignatures = strategy.name !== "gemini";
+      const wrapOpts = isImageModel
+        ? { ...strategy.wrapOpts, requestType: "image_gen" as const, stripThoughtSignatures }
+        : { ...strategy.wrapOpts, stripThoughtSignatures };
       const requestBody =
         strategy.auth === "apiKey"
-          ? body.forwardBody
+          ? prepareGeminiApiKeyBody(body.forwardBody, body.parsed)
           : maybeWrap(body.parsed, body.forwardBody, projectId, model, wrapOpts);
 
       const headers: Record<string, string> = {

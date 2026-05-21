@@ -4,18 +4,27 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { clampReasoningEffort } from "../src/providers/codex.ts";
 import { cloudThreadFromActor } from "../src/server/neo-cloud-sync.ts";
-import { LocalThreadActor, localFindThreadRun, localReadThreadRun } from "../src/server/neo-local-actor.ts";
+import {
+  LocalThreadActor,
+  localFindThreadRun,
+  localReadThreadRun,
+  toolsForAgentMode,
+} from "../src/server/neo-local-actor.ts";
 import {
   anthropicMaxOutputTokens,
   anthropicMessages,
   anthropicThinking,
   buildAnthropicInferenceBody,
+  compactionSummaryRoute,
+  compactLocalHistoryForContext,
   googleMaxOutputTokens,
   normalizeToolSchema,
   openAIMessages,
   openAIReasoningEffort,
+  openAIReasoningEffortForRequest,
   parseAnthropicSse,
   parseOpenAISse,
+  prepareLocalHistoryCompaction,
   selectModelRoute,
 } from "../src/server/neo-local-inference.ts";
 import { NeoLocalPersistence, type PersistedActorState } from "../src/server/neo-local-persistence.ts";
@@ -65,6 +74,115 @@ describe("Neo local protocol helpers", () => {
       cacheReadInputTokens: 5,
       totalInputTokens: 21,
     });
+  });
+});
+
+describe("Neo local history compaction", () => {
+  const compactSettings = { enabled: true, reserveTokens: 1_000, keepRecentTokens: 1_500 };
+
+  test("keeps small histories unchanged", () => {
+    const history = [{ role: "user" as const, text: "short request" }];
+    expect(prepareLocalHistoryCompaction(history, 10_000, compactSettings)).toBeUndefined();
+  });
+
+  test("uses pi-style LLM summary plus recent suffix before provider formatting", () => {
+    const longHistory = Array.from({ length: 60 }, (_, index) => [
+      { role: "user" as const, text: `user turn ${index} ${"u".repeat(200)}` },
+      {
+        role: "assistant" as const,
+        text: `assistant turn ${index} ${"a".repeat(200)}`,
+        toolCalls: [{ id: `TU-${index}`, name: "Read", input: { path: `file-${index}.ts` } }],
+      },
+      { role: "tool" as const, toolCallId: `TU-${index}`, toolName: "Read", text: "tool output ".repeat(60) },
+    ]).flat();
+
+    const preparation = prepareLocalHistoryCompaction(longHistory, 3_000, compactSettings);
+    expect(preparation).toBeDefined();
+    expect(preparation?.messagesToSummarize.length).toBeGreaterThan(0);
+    expect(preparation?.firstKeptIndex).toBeGreaterThan(0);
+
+    const compacted = compactLocalHistoryForContext(
+      longHistory,
+      preparation!,
+      "## Goal\nKeep working.\n\n## Critical Context\n- summarized by LLM",
+    );
+    expect(compacted.length).toBeLessThan(longHistory.length);
+    expect(compacted[0]?.role).toBe("user");
+    expect(compacted[0]?.text).toContain("[Compaction summary]");
+    expect(compacted[0]?.text).toContain("summarized by LLM");
+    expect(compacted[1]?.role).not.toBe("tool");
+
+    for (const mode of ["rush", "smart", "large", "deep"] as const) {
+      const route = selectModelRoute(mode, {});
+      if (route.provider === "anthropic") {
+        const request = {
+          actorId: "actor-compact",
+          threadId: "T-compact01-1234-1234-1234-123456789abc",
+          agentMode: mode,
+          settings: {},
+          history: compacted,
+          tools: [],
+          environment: {},
+        };
+        const longRequest = { ...request, history: longHistory };
+        const body = buildAnthropicInferenceBody(route.model, request, true);
+        const payload = JSON.stringify(body);
+        expect(payload).toContain("[Compaction summary]");
+        expect(payload.length).toBeLessThan(
+          JSON.stringify(buildAnthropicInferenceBody(route.model, longRequest, true)).length,
+        );
+      } else if (route.provider === "openai") {
+        const messages = openAIMessages(compacted, "system");
+        expect(JSON.stringify(messages)).toContain("[Compaction summary]");
+        expect(messages.length).toBeLessThan(openAIMessages(longHistory, "system").length);
+      } else {
+        expect(compacted[0]?.text).toContain("[Compaction summary]");
+      }
+    }
+  });
+
+  test("selects deep model for deep summaries and Gemini Pro for other modes", () => {
+    const baseRequest = {
+      actorId: "actor-compact",
+      threadId: "T-compact01-1234-1234-1234-123456789abc",
+      settings: {},
+      history: [],
+      tools: [],
+      environment: {},
+    };
+
+    const deepRoute = selectModelRoute("deep", {});
+    expect(compactionSummaryRoute({ ...baseRequest, agentMode: "deep" }, deepRoute)).toEqual(deepRoute);
+    expect(compactionSummaryRoute({ ...baseRequest, agentMode: "smart" }, selectModelRoute("smart", {}))).toEqual({
+      provider: "google",
+      model: "gemini-3.1-pro-preview",
+    });
+  });
+
+  test("preserves recent tool-call adjacency after compaction", () => {
+    const history = [
+      { role: "user" as const, text: "old complete turn" },
+      { role: "assistant" as const, text: "old answer" },
+      { role: "user" as const, text: "current request" },
+      {
+        role: "assistant" as const,
+        text: "calling".repeat(1000),
+        toolCalls: [{ id: "TU-keep", name: "Bash", input: {} }],
+      },
+      { role: "tool" as const, toolCallId: "TU-keep", toolName: "Bash", text: "result" },
+      { role: "user" as const, text: "next question" },
+    ];
+
+    const preparation = prepareLocalHistoryCompaction(history, 1_000, {
+      enabled: true,
+      reserveTokens: 100,
+      keepRecentTokens: 20,
+    });
+    expect(preparation).toBeDefined();
+    const compacted = compactLocalHistoryForContext(history, preparation!, "summary");
+    const openAI = openAIMessages(compacted, "system");
+    const assistantIndex = openAI.findIndex((message) => message.role === "assistant");
+    expect(openAI[assistantIndex + 1]).toMatchObject({ role: "tool", tool_call_id: "TU-keep" });
   });
 });
 
@@ -240,6 +358,113 @@ describe("Neo local persistence", () => {
 });
 
 describe("Neo local cancellation", () => {
+  test("synthesizes cancelled tool results for pending tool leases", () => {
+    const sent: unknown[] = [];
+    const threadId = "T-73345678-1234-1234-1234-123456789abc";
+    const actor = new LocalThreadActor({
+      config: {
+        hostname: "localhost",
+        port: 8765,
+        ampUpstreamUrl: "https://ampcode.com",
+        logLevel: "error",
+        providers: { anthropic: true, codex: true, google: true },
+      },
+      actorId: "actor-cancel-tool-test",
+      threadId,
+    });
+    const ws = { readyState: WebSocket.OPEN, send: (value: string) => sent.push(JSON.parse(value)) };
+    actor.open(ws as never);
+    sent.length = 0;
+
+    const toolCall = { id: "TU-canceltool1234567890", name: "Bash", input: { command: "sleep 30" } };
+    (actor as unknown as { messages: unknown[] }).messages = [
+      {
+        threadId,
+        role: "assistant",
+        messageId: "M-canceltoolassistant1",
+        content: [{ type: "tool_use", ...toolCall, complete: true }],
+        state: { type: "complete", stopReason: "tool_use" },
+        seq: 1,
+      },
+    ];
+    (actor as unknown as { history: unknown[] }).history = [{ role: "assistant", text: "", toolCalls: [toolCall] }];
+    (actor as unknown as { pendingTools: Map<string, unknown> }).pendingTools = new Map([
+      [toolCall.id, { ...toolCall, agentMode: "smart" }],
+    ]);
+
+    (actor as unknown as { cancel(): void }).cancel();
+
+    const snapshot = actor.snapshot();
+    expect(snapshot.history).toEqual([
+      { role: "assistant", text: "", toolCalls: [toolCall] },
+      expect.objectContaining({ role: "tool", toolCallId: toolCall.id, text: expect.stringContaining("cancelled") }),
+    ]);
+    expect(snapshot.messages).toContainEqual(
+      expect.objectContaining({
+        role: "user",
+        content: [expect.objectContaining({ type: "tool_result", toolUseID: toolCall.id })],
+      }),
+    );
+    expect(sent).toContainEqual(
+      expect.objectContaining({
+        type: "message_added",
+        parentToolUseId: toolCall.id,
+        message: expect.objectContaining({
+          role: "user",
+          content: [expect.objectContaining({ type: "tool_result", toolUseID: toolCall.id })],
+        }),
+      }),
+    );
+  });
+
+  test("repairs orphan tool calls when loading a persisted snapshot", () => {
+    const threadId = "T-74345678-1234-1234-1234-123456789abc";
+    const toolCall = { id: "TU-repairtool123456789", name: "Read", input: { path: "src/index.ts" } };
+    let persistedSnapshot: unknown;
+    const actor = new LocalThreadActor({
+      config: {
+        hostname: "localhost",
+        port: 8765,
+        ampUpstreamUrl: "https://ampcode.com",
+        logLevel: "error",
+        providers: { anthropic: true, codex: true, google: true },
+      },
+      actorId: "actor-repair-tool-test",
+      threadId,
+      snapshot: {
+        version: 1,
+        actorId: "actor-repair-tool-test",
+        threadId,
+        settings: {},
+        messages: [
+          {
+            threadId,
+            role: "assistant",
+            messageId: "M-repairtoolassistant",
+            content: [{ type: "tool_use", ...toolCall, complete: true }],
+            state: { type: "complete", stopReason: "tool_use" },
+            seq: 1,
+          },
+        ],
+        history: [{ role: "assistant", text: "", toolCalls: [toolCall] }],
+        queue: [],
+        seq: 2,
+        agentState: "idle",
+        environment: {},
+        title: null,
+        updatedAt: "2026-05-07T00:00:00.000Z",
+      },
+      persist: (snapshot) => {
+        persistedSnapshot = snapshot;
+      },
+    });
+
+    expect(actor.snapshot().history).toContainEqual(
+      expect.objectContaining({ role: "tool", toolCallId: toolCall.id, text: expect.stringContaining("ended") }),
+    );
+    expect(persistedSnapshot).toBeDefined();
+  });
+
   test("emits a cancelled assistant message and idle state for active inference", () => {
     const sent: unknown[] = [];
     const actor = new LocalThreadActor({
@@ -489,7 +714,7 @@ describe("Neo local model routing", () => {
   test("matches Amp modes to connector-local providers", () => {
     expect(selectModelRoute("smart", {})).toEqual({ provider: "anthropic", model: "claude-opus-4-7" });
     expect(selectModelRoute("deep", {})).toEqual({ provider: "openai", model: "gpt-5.5" });
-    expect(selectModelRoute("rush", {})).toEqual({ provider: "anthropic", model: "claude-haiku-4-5-20251001" });
+    expect(selectModelRoute("rush", {})).toEqual({ provider: "openai", model: "gpt-5.5" });
   });
 
   test("preserves deep mode in thread settings for inherited subagent model selection", () => {
@@ -747,6 +972,36 @@ describe("Neo OpenAI reasoning effort", () => {
     expect(clampReasoningEffort("gpt-5.3", "minimal")).toBe("low");
     expect(clampReasoningEffort("gpt-5.1-codex-mini", "low")).toBe("medium");
     expect(clampReasoningEffort("gpt-5.1-codex-mini", "high")).toBe("high");
+  });
+
+  test("defaults rush to minimal reasoning while preserving explicit efforts", () => {
+    expect(openAIReasoningEffortForRequest("rush", undefined)).toBe("minimal");
+    expect(openAIReasoningEffortForRequest("rush", "low")).toBe("low");
+    expect(openAIReasoningEffortForRequest("smart", undefined)).toBe("medium");
+  });
+});
+
+describe("Neo rush tool selection", () => {
+  test("removes redundant grep/glob/create_file tools but keeps shell_command and apply_patch", () => {
+    const tools = [
+      { name: "shell_command", inputSchema: {} },
+      { name: "apply_patch", inputSchema: {} },
+      { name: "grep", inputSchema: {} },
+      { name: "Glob", inputSchema: {} },
+      { name: "create_file", inputSchema: {} },
+      { name: "task", inputSchema: {} },
+      { name: "read_thread", inputSchema: {}, meta: { deferred: true } },
+    ];
+
+    expect(toolsForAgentMode("rush", tools).map((tool) => tool.name)).toEqual(["shell_command", "apply_patch", "task"]);
+    expect(toolsForAgentMode("smart", tools).map((tool) => tool.name)).toEqual([
+      "shell_command",
+      "apply_patch",
+      "grep",
+      "Glob",
+      "create_file",
+      "task",
+    ]);
   });
 });
 

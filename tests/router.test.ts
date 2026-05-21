@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { buildGeminiApiKeyUrl, provider as googleProvider } from "../src/providers/google.ts";
+import { buildGeminiApiKeyUrl, provider as googleProvider, prepareGeminiApiKeyBody } from "../src/providers/google.ts";
 import { parseBody } from "../src/server/body.ts";
+import { maybeWrap, stripGoogleThoughtSignatures } from "../src/utils/code-assist.ts";
 import { resolveModel, rewriteBodyModel } from "../src/utils/models.ts";
 import * as path from "../src/utils/path.ts";
 
@@ -55,6 +56,79 @@ describe("google Gemini API key support", () => {
     ).toBe(
       "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:streamGenerateContent?key=test-key&alt=sse",
     );
+  });
+});
+
+describe("google thought signatures", () => {
+  test("strips Gemini thought signatures before cross-strategy forwarding", () => {
+    const body = {
+      contents: [
+        {
+          role: "model",
+          parts: [
+            { text: "reasoning summary", thoughtSignature: "gemini-bound-signature", thought: true },
+            { thought_signature: "legacy-signature" },
+            { text: "visible answer" },
+          ],
+        },
+      ],
+    };
+
+    const stripped = stripGoogleThoughtSignatures(body);
+
+    expect(stripped).toEqual({
+      contents: [
+        {
+          role: "model",
+          parts: [{ text: "reasoning summary", thought: true }, { text: "visible answer" }],
+        },
+      ],
+    });
+    expect(body.contents[0]!.parts[0]!.thoughtSignature).toBe("gemini-bound-signature");
+  });
+
+  test("wraps Antigravity requests without provider-bound thought signatures", () => {
+    const wrapped = maybeWrap(
+      {
+        contents: [{ role: "model", parts: [{ text: "x", thoughtSignature: "gemini-bound-signature" }] }],
+      },
+      "{}",
+      "project",
+      "gemini-3-flash",
+      {
+        userAgent: "antigravity",
+        requestIdPrefix: "agent",
+        requestType: "agent",
+        stripThoughtSignatures: true,
+      },
+    );
+
+    const envelope = JSON.parse(wrapped) as { request: { contents: Array<{ parts: Array<Record<string, unknown>> }> } };
+    expect(envelope.request.contents[0]!.parts[0]).toEqual({ text: "x" });
+  });
+
+  test("strips thought signatures before Gemini API key fallback", () => {
+    const body = JSON.stringify({
+      contents: [
+        {
+          role: "model",
+          parts: [
+            { text: "reasoning summary", thoughtSignature: "oauth-bound-signature", thought: true },
+            { thought_signature: "legacy-signature" },
+            { text: "visible answer" },
+          ],
+        },
+      ],
+    });
+
+    expect(JSON.parse(prepareGeminiApiKeyBody(body, null))).toEqual({
+      contents: [
+        {
+          role: "model",
+          parts: [{ text: "reasoning summary", thought: true }, { text: "visible answer" }],
+        },
+      ],
+    });
   });
 });
 

@@ -9,6 +9,8 @@ interface WrapOptions {
   requestType?: "agent" | "image_gen";
 }
 
+const GOOGLE_THOUGHT_SIGNATURE_KEYS = new Set(["thoughtSignature", "thought_signature"]);
+
 /** Wrap a raw request body in the Cloud Code Assist envelope. */
 function wrapRequest(opts: WrapOptions): string {
   const isImageGen = opts.requestType === "image_gen";
@@ -117,6 +119,34 @@ function fixFunctionResponseNames(body: Record<string, unknown>): void {
   }
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function isEmptyRecord(value: unknown): boolean {
+  return isRecord(value) && Object.keys(value).length === 0;
+}
+
+function cloneWithoutGoogleThoughtSignatures(value: unknown, key?: string): unknown {
+  if (Array.isArray(value)) {
+    const cloned = value.map((item) => cloneWithoutGoogleThoughtSignatures(item));
+    return key === "parts" ? cloned.filter((item) => !isEmptyRecord(item)) : cloned;
+  }
+
+  if (!isRecord(value)) return value;
+
+  const cloned: Record<string, unknown> = {};
+  for (const [entryKey, entryValue] of Object.entries(value)) {
+    if (GOOGLE_THOUGHT_SIGNATURE_KEYS.has(entryKey)) continue;
+    cloned[entryKey] = cloneWithoutGoogleThoughtSignatures(entryValue, entryKey);
+  }
+  return cloned;
+}
+
+export function stripGoogleThoughtSignatures(body: Record<string, unknown>): Record<string, unknown> {
+  return cloneWithoutGoogleThoughtSignatures(body) as Record<string, unknown>;
+}
+
 /** Wrap body in CCA envelope if not already wrapped. */
 export function maybeWrap(
   parsed: Record<string, unknown> | null,
@@ -127,10 +157,12 @@ export function maybeWrap(
     userAgent: "antigravity" | "pi-coding-agent";
     requestIdPrefix: "agent" | "pi";
     requestType?: "agent" | "image_gen";
+    stripThoughtSignatures?: boolean;
   },
 ): string {
   if (!parsed) return raw;
   if (parsed.project) return raw;
-  fixFunctionResponseNames(parsed);
-  return wrapRequest({ projectId, model, body: parsed, ...opts });
+  const requestBody = opts.stripThoughtSignatures ? stripGoogleThoughtSignatures(parsed) : structuredClone(parsed);
+  fixFunctionResponseNames(requestBody);
+  return wrapRequest({ projectId, model, body: requestBody, ...opts });
 }

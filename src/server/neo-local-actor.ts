@@ -33,6 +33,7 @@ const THREAD_ID_PATTERN = /T-[0-9A-Za-z][0-9A-Za-z-]*/;
 const READ_THREAD_MAX_CHARS = 80_000;
 const READ_THREAD_TOOL_RESULT_MAX_CHARS = 8_000;
 const READ_THREAD_JSON_BLOCK_MAX_CHARS = 2_000;
+const RUSH_REMOVED_TOOL_NAMES = new Set(["grep", "glob", "create_file"]);
 interface QueuedUserMessage {
   role: "user";
   messageId: string;
@@ -143,6 +144,12 @@ function clipText(text: string, max: number, suffix = "\n[truncated]"): string {
   return text.length > max ? `${text.slice(0, Math.max(0, max - suffix.length))}${suffix}` : text;
 }
 
+export function toolsForAgentMode(agentMode: string, tools: NeoToolSpec[]): NeoToolSpec[] {
+  return tools.filter(
+    (tool) => !tool.meta?.deferred && (agentMode !== "rush" || !RUSH_REMOVED_TOOL_NAMES.has(tool.name.toLowerCase())),
+  );
+}
+
 export function localFindThreadRun(input: JsonRecord, store = new NeoLocalPersistence()): JsonRecord | null {
   const query = typeof input.query === "string" ? input.query : "";
   const limit = typeof input.limit === "number" && Number.isFinite(input.limit) ? input.limit : 20;
@@ -198,6 +205,13 @@ export class LocalThreadActor {
       this.cloud = snapshot.cloud;
       this.currentAgentMode = this.agentMode();
       this.currentReasoningEffort = this.reasoningEffort();
+      if (
+        this.synthesizeMissingToolResults(
+          "Tool execution did not complete before the connector session ended.",
+          false,
+        ) > 0
+      )
+        this.persist();
       return;
     }
     const fromInput = jsonRecord(options.input?.input);
@@ -464,7 +478,13 @@ export class LocalThreadActor {
     this.currentAgentMode = agentMode;
     this.currentReasoningEffort = reasoningEffort;
     this.setAgentState("working", assistantId, agentMode, reasoningEffort);
-    this.broadcast({ type: "inference_tools", messageId: assistantId, agentMode, tools: [...this.tools.keys()] });
+    const activeTools = toolsForAgentMode(agentMode, [...this.tools.values()]);
+    this.broadcast({
+      type: "inference_tools",
+      messageId: assistantId,
+      agentMode,
+      tools: activeTools.map((tool) => tool.name),
+    });
 
     if (this.inferenceAbort) this.inferenceAbort.abort();
     const abortController = new AbortController();
@@ -489,9 +509,14 @@ export class LocalThreadActor {
           reasoningEffort,
           settings: this.settings,
           history: this.history,
-          tools: [...this.tools.values()].filter((tool) => !tool.meta?.deferred),
+          tools: activeTools,
           environment: this.environment,
           signal: abortController.signal,
+          onHistoryCompacted: (history) => {
+            if (generation !== this.generation) return;
+            this.history = history;
+            this.persist();
+          },
         },
         {
           // Send each text chunk as an INCREMENTAL delta. Neo `delta.blocks` is
@@ -654,6 +679,64 @@ export class LocalThreadActor {
 
   private receiveToolResult(msg: JsonRecord): void {
     this.receiveToolRun(String(msg.toolCallId ?? ""), jsonRecord(msg.run), true);
+  }
+
+  private synthesizeMissingToolResults(
+    reason: string,
+    shouldBroadcast: boolean,
+    onlyToolCallIds?: Set<string>,
+  ): number {
+    const ordered = [...this.messages].sort((a, b) => a.seq - b.seq);
+    let synthesizedCount = 0;
+    for (let i = 0; i < ordered.length; i++) {
+      const message = ordered[i]!;
+      if (message.role !== "assistant") continue;
+      const expectedIds = message.content
+        .filter((block): block is NeoToolUseBlock => jsonRecord(block).type === "tool_use")
+        .map((block) => block.id)
+        .filter((id) => !onlyToolCallIds || onlyToolCallIds.has(id));
+      if (expectedIds.length === 0) continue;
+
+      const answeredIds = new Set<string>();
+      let scan = i + 1;
+      while (scan < ordered.length && ordered[scan]?.role === "user") {
+        const content = ordered[scan]?.content ?? [];
+        const hasNonToolResult = content.some((block) => jsonRecord(block).type !== "tool_result");
+        if (hasNonToolResult) break;
+        for (const block of content) {
+          const item = jsonRecord(block);
+          if (item.type === "tool_result" && typeof item.toolUseID === "string") answeredIds.add(item.toolUseID);
+        }
+        scan++;
+      }
+
+      const missingIds = expectedIds.filter((id) => !answeredIds.has(id));
+      if (missingIds.length === 0) continue;
+
+      const nextSeq = ordered[i + 1]?.seq;
+      const seq = nextSeq === undefined ? this.nextSeq() : message.seq + (nextSeq - message.seq) / 2;
+      const run = { status: "cancelled", reason };
+      const synthetic = {
+        threadId: this.options.threadId,
+        role: "user" as const,
+        messageId: missingIds.length === 1 ? toolResultMessageId(missingIds[0]!) : newMessageId(),
+        content: missingIds.map((toolCallId) => ({ type: "tool_result", toolUseID: toolCallId, run })),
+        createdAt: nowIso(),
+        seq,
+      };
+      this.messages.push(synthetic);
+      ordered.splice(i + 1, 0, synthetic);
+      synthesizedCount += missingIds.length;
+      if (shouldBroadcast)
+        this.broadcast({
+          type: "message_added",
+          message: this.protocolMessage(synthetic),
+          seq: synthetic.seq,
+          parentToolUseId: missingIds.length === 1 ? missingIds[0] : undefined,
+        });
+    }
+    if (synthesizedCount > 0) this.rebuildHistory();
+    return synthesizedCount;
   }
 
   private receiveToolRun(toolCallId: string, run: JsonRecord, ackExecutor: boolean): void {
@@ -929,6 +1012,13 @@ export class LocalThreadActor {
     }
     const messageId =
       this.activeAssistantMessageId ?? this.messages.findLast((message) => message.role === "assistant")?.messageId;
+    const pendingToolIds = new Set(this.pendingTools.keys());
+    if (pendingToolIds.size > 0)
+      this.synthesizeMissingToolResults(
+        "Tool execution was cancelled before a result was returned.",
+        true,
+        pendingToolIds,
+      );
     this.pendingTools.clear();
     this.approvals.clear();
     this.broadcastApprovalQueue();

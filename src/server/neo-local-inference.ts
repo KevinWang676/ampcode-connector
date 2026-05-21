@@ -19,6 +19,7 @@ export interface LocalInferenceRequest {
   tools: NeoToolSpec[];
   environment?: JsonRecord;
   signal?: AbortSignal;
+  onHistoryCompacted?: (history: LocalHistoryMessage[]) => void;
 }
 
 export interface LocalInferenceResult {
@@ -41,6 +42,154 @@ export interface InferenceStreamHandler {
 interface ModelRoute {
   provider: "anthropic" | "openai" | "google";
   model: string;
+}
+
+const LOCAL_COMPACTION_RESERVE_TOKENS = 16_384;
+const LOCAL_COMPACTION_KEEP_RECENT_TOKENS = 20_000;
+const LOCAL_COMPACTION_SUMMARY_PREFIX = "[Compaction summary]";
+const LOCAL_COMPACTION_TOOL_RESULT_MAX_CHARS = 2_000;
+const LOCAL_COMPACTION_DEFAULT_MODEL = "gemini-3.1-pro-preview";
+
+interface LocalCompactionSettings {
+  enabled: boolean;
+  reserveTokens: number;
+  keepRecentTokens: number;
+}
+
+interface LocalHistoryCompactionPreparation {
+  messagesToSummarize: LocalHistoryMessage[];
+  turnPrefixMessages: LocalHistoryMessage[];
+  isSplitTurn: boolean;
+  previousSummary?: string;
+  tokensBefore: number;
+  firstKeptIndex: number;
+}
+
+function contextWindowTokensForRoute(route: ModelRoute): number {
+  if (route.provider === "google") return 1_000_000;
+  if (route.provider === "openai") return 400_000;
+  return 200_000;
+}
+
+function compactionSettings(settings: JsonRecord): LocalCompactionSettings {
+  const raw = jsonRecord(settings["localNeo.compaction"]);
+  return {
+    enabled: raw.enabled !== false,
+    reserveTokens: numberSetting(raw.reserveTokens, LOCAL_COMPACTION_RESERVE_TOKENS),
+    keepRecentTokens: numberSetting(raw.keepRecentTokens, LOCAL_COMPACTION_KEEP_RECENT_TOKENS),
+  };
+}
+
+function numberSetting(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function estimateHistoryTokens(message: LocalHistoryMessage): number {
+  let chars = message.text?.length ?? 0;
+  for (const call of message.toolCalls ?? []) chars += call.name.length + JSON.stringify(call.input).length;
+  if (message.toolCallId) chars += message.toolCallId.length;
+  if (message.toolName) chars += message.toolName.length;
+  return Math.ceil(chars / 4);
+}
+
+function findLocalTurnStart(history: LocalHistoryMessage[], entryIndex: number, startIndex: number): number {
+  for (let i = entryIndex; i >= startIndex; i--) if (history[i]?.role === "user") return i;
+  return -1;
+}
+
+function findLocalHistoryCutPoint(
+  history: LocalHistoryMessage[],
+  startIndex: number,
+  keepRecentTokens: number,
+): { firstKeptIndex: number; turnStartIndex: number; isSplitTurn: boolean } {
+  const cutPoints: number[] = [];
+  for (let i = startIndex; i < history.length; i++) {
+    const role = history[i]?.role;
+    if (role === "user" || role === "assistant") cutPoints.push(i);
+  }
+  if (cutPoints.length === 0) return { firstKeptIndex: startIndex, turnStartIndex: -1, isSplitTurn: false };
+
+  let accumulatedTokens = 0;
+  let cutIndex = cutPoints[0]!;
+  for (let i = history.length - 1; i >= startIndex; i--) {
+    accumulatedTokens += estimateHistoryTokens(history[i]!);
+    if (accumulatedTokens >= keepRecentTokens) {
+      cutIndex = cutPoints.find((point) => point >= i) ?? cutIndex;
+      break;
+    }
+  }
+
+  const isUserMessage = history[cutIndex]?.role === "user";
+  const turnStartIndex = isUserMessage ? -1 : findLocalTurnStart(history, cutIndex, startIndex);
+  return { firstKeptIndex: cutIndex, turnStartIndex, isSplitTurn: !isUserMessage && turnStartIndex !== -1 };
+}
+
+export function prepareLocalHistoryCompaction(
+  history: LocalHistoryMessage[],
+  contextWindowTokens: number,
+  settings: LocalCompactionSettings = {
+    enabled: true,
+    reserveTokens: LOCAL_COMPACTION_RESERVE_TOKENS,
+    keepRecentTokens: LOCAL_COMPACTION_KEEP_RECENT_TOKENS,
+  },
+): LocalHistoryCompactionPreparation | undefined {
+  if (!settings.enabled) return undefined;
+  const tokensBefore = history.reduce((sum, message) => sum + estimateHistoryTokens(message), 0);
+  if (tokensBefore <= contextWindowTokens - settings.reserveTokens) return undefined;
+
+  const first = history[0];
+  const previousSummary =
+    first?.role === "user" && first.text?.startsWith(LOCAL_COMPACTION_SUMMARY_PREFIX)
+      ? first.text.slice(LOCAL_COMPACTION_SUMMARY_PREFIX.length).trim()
+      : undefined;
+  const boundaryStart = previousSummary ? 1 : 0;
+  const cutPoint = findLocalHistoryCutPoint(history, boundaryStart, settings.keepRecentTokens);
+  const historyEnd = cutPoint.isSplitTurn ? cutPoint.turnStartIndex : cutPoint.firstKeptIndex;
+  if (historyEnd <= boundaryStart) return undefined;
+
+  return {
+    messagesToSummarize: history.slice(boundaryStart, historyEnd),
+    turnPrefixMessages: cutPoint.isSplitTurn ? history.slice(cutPoint.turnStartIndex, cutPoint.firstKeptIndex) : [],
+    isSplitTurn: cutPoint.isSplitTurn,
+    previousSummary,
+    tokensBefore,
+    firstKeptIndex: cutPoint.firstKeptIndex,
+  };
+}
+
+export function compactLocalHistoryForContext(
+  history: LocalHistoryMessage[],
+  preparation: LocalHistoryCompactionPreparation,
+  summary: string,
+): LocalHistoryMessage[] {
+  const kept = history.slice(preparation.firstKeptIndex);
+  if (kept.length === 0) return history;
+  return [{ role: "user", text: `${LOCAL_COMPACTION_SUMMARY_PREFIX}\n${summary.trim()}` }, ...kept];
+}
+
+function serializeLocalHistory(messages: LocalHistoryMessage[]): string {
+  const parts: string[] = [];
+  for (const message of messages) {
+    if (message.role === "system") continue;
+    if (message.role === "user") parts.push(`[User]: ${message.text ?? ""}`);
+    if (message.role === "assistant") {
+      if (message.text) parts.push(`[Assistant]: ${message.text}`);
+      if (message.toolCalls?.length) {
+        const calls = message.toolCalls.map((call) => `${call.name}(${JSON.stringify(call.input)})`).join("; ");
+        parts.push(`[Assistant tool calls]: ${calls}`);
+      }
+    }
+    if (message.role === "tool") {
+      parts.push(`[Tool result]: ${clipToolResult(message.text ?? "")}`);
+    }
+  }
+  return parts.join("\n\n");
+}
+
+function clipToolResult(text: string): string {
+  if (text.length <= LOCAL_COMPACTION_TOOL_RESULT_MAX_CHARS) return text;
+  const truncated = text.length - LOCAL_COMPACTION_TOOL_RESULT_MAX_CHARS;
+  return `${text.slice(0, LOCAL_COMPACTION_TOOL_RESULT_MAX_CHARS)}\n\n[... ${truncated} more characters truncated]`;
 }
 
 export async function generateLocalThreadTitle(
@@ -111,7 +260,7 @@ export async function extractLocalThreadContent(
     actorId: `read-thread-${mentionedThreadId}`,
     threadId: currentThreadId,
     agentMode: "rush",
-    settings: { "internal.model": "anthropic/claude-haiku-4-5-20251001" },
+    settings: { "internal.model": "openai/gpt-5.5" },
     history: [{ role: "user", text: prompt }],
     tools: [],
     environment: {},
@@ -119,20 +268,238 @@ export async function extractLocalThreadContent(
   return result.text.trim() || threadMarkdown;
 }
 
+async function compactLocalHistoryIfNeeded(
+  config: ProxyConfig,
+  request: LocalInferenceRequest,
+  route: ModelRoute,
+): Promise<LocalInferenceRequest> {
+  const preparation = prepareLocalHistoryCompaction(
+    request.history,
+    contextWindowTokensForRoute(route),
+    compactionSettings(request.settings),
+  );
+  if (!preparation) return request;
+
+  const summaryRoute = compactionSummaryRoute(request, route);
+  const summary = await generateLocalCompactionSummary(
+    config,
+    request.threadId,
+    preparation,
+    summaryRoute,
+    request.signal,
+  );
+  const compactedHistory = compactLocalHistoryForContext(request.history, preparation, summary);
+  request.onHistoryCompacted?.(compactedHistory);
+  logger.warn("Neo local history compacted before inference", {
+    mode: request.agentMode,
+    model: route.model,
+    provider: route.provider,
+    originalMessages: request.history.length,
+    compactedMessages: compactedHistory.length,
+    tokensBefore: preparation.tokensBefore,
+    splitTurn: preparation.isSplitTurn,
+    summaryProvider: summaryRoute.provider,
+    summaryModel: summaryRoute.model,
+  });
+  return { ...request, history: compactedHistory };
+}
+
+export function compactionSummaryRoute(request: LocalInferenceRequest, inferenceRoute: ModelRoute): ModelRoute {
+  if (request.agentMode === "deep") return inferenceRoute;
+  return { provider: "google", model: LOCAL_COMPACTION_DEFAULT_MODEL };
+}
+
+async function generateLocalCompactionSummary(
+  config: ProxyConfig,
+  threadId: string,
+  preparation: LocalHistoryCompactionPreparation,
+  summaryRoute: ModelRoute,
+  signal?: AbortSignal,
+): Promise<string> {
+  const historySummary = preparation.messagesToSummarize.length
+    ? await generateLocalSummary(
+        config,
+        threadId,
+        preparation.messagesToSummarize,
+        preparation.previousSummary,
+        SUMMARIZATION_PROMPT,
+        summaryRoute,
+        signal,
+      )
+    : (preparation.previousSummary ?? "No prior history.");
+
+  if (!preparation.isSplitTurn || preparation.turnPrefixMessages.length === 0) return historySummary;
+  const turnSummary = await generateLocalSummary(
+    config,
+    threadId,
+    preparation.turnPrefixMessages,
+    undefined,
+    TURN_PREFIX_SUMMARIZATION_PROMPT,
+    summaryRoute,
+    signal,
+  );
+  return `${historySummary}\n\n---\n\n**Turn Context (split turn):**\n\n${turnSummary}`;
+}
+
+async function generateLocalSummary(
+  config: ProxyConfig,
+  threadId: string,
+  messages: LocalHistoryMessage[],
+  previousSummary: string | undefined,
+  prompt: string,
+  summaryRoute: ModelRoute,
+  signal?: AbortSignal,
+): Promise<string> {
+  let promptText = `<conversation>\n${serializeLocalHistory(messages)}\n</conversation>\n\n`;
+  if (previousSummary) promptText += `<previous-summary>\n${previousSummary}\n</previous-summary>\n\n`;
+  promptText += previousSummary ? UPDATE_SUMMARIZATION_PROMPT : prompt;
+
+  if (summaryRoute.provider === "google") {
+    const body = {
+      contents: [
+        { role: "user", parts: [{ text: SUMMARIZATION_SYSTEM_PROMPT }] },
+        { role: "user", parts: [{ text: promptText }] },
+      ],
+      generationConfig: { maxOutputTokens: 4096 },
+    };
+    const json = await callLocalProvider(
+      config,
+      "google",
+      `/v1beta/models/${encodeURIComponent(summaryRoute.model)}:generateContent`,
+      body,
+      threadId,
+      signal,
+    );
+    return textFromGoogleContent(json).trim();
+  }
+
+  if (summaryRoute.provider === "openai") {
+    const body = {
+      model: summaryRoute.model,
+      stream: false,
+      messages: [
+        { role: "system", content: SUMMARIZATION_SYSTEM_PROMPT },
+        { role: "user", content: promptText },
+      ],
+    };
+    const json = await callLocalProvider(config, "openai", "/v1/chat/completions", body, threadId, signal);
+    const choice = Array.isArray(json.choices) ? jsonRecord(json.choices[0]) : {};
+    const message = jsonRecord(choice.message);
+    return typeof message.content === "string" ? message.content.trim() : "";
+  }
+
+  const body = {
+    model: summaryRoute.model,
+    max_tokens: 4096,
+    stream: false,
+    system: SUMMARIZATION_SYSTEM_PROMPT,
+    messages: [{ role: "user", content: promptText }],
+  };
+  const json = await callLocalProvider(config, "anthropic", "/v1/messages", body, threadId, signal);
+  return textFromAnthropicContent(json.content).trim();
+}
+
+function textFromGoogleContent(json: JsonRecord): string {
+  const candidate = Array.isArray(json.candidates) ? jsonRecord(json.candidates[0]) : {};
+  const content = jsonRecord(candidate.content);
+  const parts = Array.isArray(content.parts) ? content.parts : [];
+  return parts
+    .map((part) => {
+      const item = jsonRecord(part);
+      return typeof item.text === "string" ? item.text : "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function textFromAnthropicContent(content: unknown): string {
+  return (Array.isArray(content) ? content : [])
+    .map((block) => {
+      const item = jsonRecord(block);
+      return typeof item.text === "string" ? item.text : "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+const SUMMARIZATION_SYSTEM_PROMPT =
+  "You are a context summarization assistant. Read a conversation between a user and an AI coding assistant, then produce only the requested structured summary. Do not continue the conversation.";
+
+const SUMMARIZATION_PROMPT = `The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
+
+Use this EXACT format:
+
+## Goal
+[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]
+
+## Constraints & Preferences
+- [Any constraints, preferences, or requirements mentioned by user]
+- [Or "(none)" if none were mentioned]
+
+## Progress
+### Done
+- [x] [Completed tasks/changes]
+
+### In Progress
+- [ ] [Current work]
+
+### Blocked
+- [Issues preventing progress, if any]
+
+## Key Decisions
+- **[Decision]**: [Brief rationale]
+
+## Next Steps
+1. [Ordered list of what should happen next]
+
+## Critical Context
+- [Any data, examples, or references needed to continue]
+- [Or "(none)" if not applicable]
+
+Keep each section concise. Preserve exact file paths, function names, and error messages.`;
+
+const UPDATE_SUMMARIZATION_PROMPT = `The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.
+
+Update the existing structured summary with new information. RULES:
+- PRESERVE all existing information from the previous summary
+- ADD new progress, decisions, and context from the new messages
+- UPDATE the Progress section: move items from "In Progress" to "Done" when completed
+- UPDATE "Next Steps" based on what was accomplished
+- PRESERVE exact file paths, function names, and error messages
+- If something is no longer relevant, you may remove it
+
+Use the same structured summary format.`;
+
+const TURN_PREFIX_SUMMARIZATION_PROMPT = `This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.
+
+Summarize the prefix to provide context for the retained suffix:
+
+## Original Request
+[What did the user ask for in this turn?]
+
+## Early Progress
+- [Key decisions and work done in the prefix]
+
+## Context for Suffix
+- [Information needed to understand the retained recent work]
+
+Be concise. Focus on what's needed to understand the kept suffix.`;
+
 export async function inferLocal(
   config: ProxyConfig,
   request: LocalInferenceRequest,
   handler?: InferenceStreamHandler,
 ): Promise<LocalInferenceResult> {
   const modelRoute = selectModelRoute(request.agentMode, request.settings);
+  const effectiveRequest = await compactLocalHistoryIfNeeded(config, request, modelRoute);
 
   switch (modelRoute.provider) {
     case "anthropic":
-      return inferAnthropic(config, request, modelRoute, handler);
+      return inferAnthropic(config, effectiveRequest, modelRoute, handler);
     case "openai":
-      return inferOpenAI(config, request, modelRoute, handler);
+      return inferOpenAI(config, effectiveRequest, modelRoute, handler);
     case "google":
-      return inferGoogle(config, request, modelRoute, handler);
+      return inferGoogle(config, effectiveRequest, modelRoute, handler);
   }
 }
 
@@ -144,7 +511,7 @@ export function selectModelRoute(agentMode: string, settings: JsonRecord): Model
     case "deep":
       return { provider: "openai", model: "gpt-5.5" };
     case "rush":
-      return { provider: "anthropic", model: "claude-haiku-4-5-20251001" };
+      return { provider: "openai", model: "gpt-5.5" };
     case "large":
       return { provider: "anthropic", model: "claude-opus-4-6" };
     default:
@@ -494,7 +861,7 @@ async function inferOpenAI(
     model: route.model,
     stream: streaming,
     messages: openAIMessages(request.history, systemPrompt(request)),
-    reasoning_effort: openAIReasoningEffort(request.reasoningEffort),
+    reasoning_effort: openAIReasoningEffortForRequest(request.agentMode, request.reasoningEffort),
     ...(request.tools.length > 0 ? { tools: request.tools.map(toOpenAITool), tool_choice: "auto" } : {}),
   };
 
@@ -1221,6 +1588,10 @@ export function openAIReasoningEffort(effort?: string): string {
     default:
       return "medium";
   }
+}
+
+export function openAIReasoningEffortForRequest(agentMode: string, effort?: string): string {
+  return openAIReasoningEffort(effort ?? (agentMode === "rush" ? "minimal" : undefined));
 }
 
 function parseToolArguments(value: unknown): JsonRecord {
